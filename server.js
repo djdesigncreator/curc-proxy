@@ -1,51 +1,81 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-1
+   versao: curc-3
    Plataforma EAD marketplace para o mercado mocambicano.
 
-   Este ficheiro contem:
-     - ligacao a Data API do Bubble (token de admin)
-     - contas: codigo de confirmacao por email (Resend)
-     - catalogo de cursos e detalhe do curso
-     - inscricao em cursos gratis
-     - pagamento por M-Pesa e e-Mola (MoPayment)
-     - comissao da plataforma e saldo do formador
+   Novidades desta versao:
+     - variaveis de ambiente limpas ao arrancar (espacos, aspas,
+       https:// a mais, barras no fim)
+     - todos os fetch passam por buscar(), que mostra a causa real
+       em vez do inutil "fetch failed"
+     - rota POST /diag-storage que testa mesmo o Bunny Storage
+       e o Bunny Stream, e diz onde e que parte
 
    Sem dependencias externas. Corre com node >= 18.
    ============================================================ */
 
 const http = require('http');
 const crypto = require('crypto');
+const dns = require('dns').promises;
 
-const VERSAO = 'curc-2';
+const VERSAO = 'curc-3';
 const PORTA = process.env.PORT || 3000;
+
+/* ============================================================
+   0. LIMPEZA DAS VARIAVEIS DE AMBIENTE
+   ============================================================ */
+
+/* Tira espacos, quebras de linha e aspas que ficam agarradas
+   quando se cola o valor no painel da Bunny. */
+
+function limparValor(valor) {
+  return String(valor === undefined || valor === null ? '' : valor)
+    .trim()
+    .replace(/^["']+|["']+$/g, '')
+    .trim();
+}
+
+/* Para nomes de maquina: tira o esquema e a barra do fim.
+   storage.bunnycdn.com  ·  nao  https://storage.bunnycdn.com/ */
+
+function limparHost(valor) {
+  return limparValor(valor)
+    .replace(/^https?:\/\//i, '')
+    .replace(/\/+$/, '');
+}
+
+/* Para enderecos completos: mantem o esquema, tira a barra do fim. */
+
+function limparUrl(valor) {
+  return limparValor(valor).replace(/\/+$/, '');
+}
 
 /* ---------- variaveis de ambiente ---------- */
 
-const BUBBLE_BASE = (process.env.BUBBLE_BASE || '').replace(/\/+$/, '');
-const BUBBLE_TOKEN = process.env.BUBBLE_TOKEN || '';
+const BUBBLE_BASE = limparUrl(process.env.BUBBLE_BASE);
+const BUBBLE_TOKEN = limparValor(process.env.BUBBLE_TOKEN);
 
-const MOZ_WALLET = process.env.MOZ_WALLET || '';
-const MOPAY_BASE = (process.env.MOPAY_BASE || 'https://mozpayment.co.mz/api/1.1/wf').replace(/\/+$/, '');
+const MOZ_WALLET = limparValor(process.env.MOZ_WALLET);
+const MOPAY_BASE = limparUrl(process.env.MOPAY_BASE) || 'https://mozpayment.co.mz/api/1.1/wf';
 
-const COMISSAO_PCT = Number(process.env.COMISSAO_PCT || 15);
+const COMISSAO_PCT = Number(limparValor(process.env.COMISSAO_PCT) || 15);
 
-const RESEND_KEY = process.env.RESEND_KEY || '';
-const MAIL_FROM = process.env.MAIL_FROM || 'CURC <noreply@curc.co.mz>';
+const RESEND_KEY = limparValor(process.env.RESEND_KEY);
+const MAIL_FROM = limparValor(process.env.MAIL_FROM) || 'CURC <noreply@curc.co.mz>';
 
-const APP_URL = process.env.APP_URL || '';
-const UPLOAD_SECRET = process.env.UPLOAD_SECRET || '';
+const APP_URL = limparUrl(process.env.APP_URL);
+const UPLOAD_SECRET = limparValor(process.env.UPLOAD_SECRET);
 
 /* Bunny Storage — capas dos cursos, fotos e anexos */
-const STORAGE_ZONE = process.env.STORAGE_ZONE || '';
-const STORAGE_PASSWORD = process.env.STORAGE_PASSWORD || '';
-const STORAGE_HOST = process.env.STORAGE_HOST || 'storage.bunnycdn.com';
-const CDN_HOST = process.env.CDN_HOST || '';
+const STORAGE_ZONE = limparValor(process.env.STORAGE_ZONE);
+const STORAGE_PASSWORD = limparValor(process.env.STORAGE_PASSWORD);
+const STORAGE_HOST = limparHost(process.env.STORAGE_HOST) || 'storage.bunnycdn.com';
+const CDN_HOST = limparHost(process.env.CDN_HOST);
 
 /* Bunny Stream — videos das aulas e de introducao */
-const STREAM_LIBRARY = process.env.STREAM_LIBRARY || '';
-const STREAM_KEY = process.env.STREAM_KEY || '';
-const STREAM_CDN = process.env.STREAM_CDN || '';
+const STREAM_LIBRARY = limparValor(process.env.STREAM_LIBRARY);
+const STREAM_KEY = limparValor(process.env.STREAM_KEY);
+const STREAM_CDN = limparHost(process.env.STREAM_CDN);
 
 /* ---------- nomes dos data types no Bubble ---------- */
 /* O Bubble aceita o nome do tipo em minusculas, sem espacos. */
@@ -156,6 +186,35 @@ function referencia(prefixo) {
   return prefixo + '-' + Date.now() + '-' + codigoAleatorio(5);
 }
 
+/* ---------- causa real de um erro de rede ---------- */
+
+/* O fetch do Node atira sempre "fetch failed" e esconde o motivo
+   dentro de error.cause. Isto desenterra-o. */
+
+function causaDe(e) {
+  if (!e) return 'desconhecida';
+  const causa = e.cause;
+  if (!causa) return e.message || String(e);
+  const codigo = causa.code ? String(causa.code) : '';
+  const msg = causa.message ? String(causa.message) : '';
+  if (codigo && msg) return codigo + ' — ' + msg;
+  return codigo || msg || String(causa);
+}
+
+/* Envolve o fetch para que qualquer falha de rede diga
+   quem falhou, porque falhou e para onde ia. */
+
+async function buscar(url, opcoes, quem) {
+  try {
+    return await fetch(url, opcoes);
+  } catch (e) {
+    const limpo = String(url).split('?')[0];
+    throw new Error(
+      (quem || 'ligacao') + ' falhou: ' + causaDe(e) + ' · destino: ' + limpo
+    );
+  }
+}
+
 /* ============================================================
    2. DATA API DO BUBBLE
    ============================================================ */
@@ -181,7 +240,7 @@ async function bubbleListar(tipo, restricoes, opcoes) {
   }
 
   const url = BUBBLE_BASE + '/' + tipo + '?' + params.toString();
-  const resposta = await fetch(url, { headers: cabecalhosBubble() });
+  const resposta = await buscar(url, { headers: cabecalhosBubble() }, 'Bubble listar ' + tipo);
 
   if (!resposta.ok) {
     const detalhe = await resposta.text();
@@ -218,9 +277,11 @@ async function bubbleTodos(tipo, restricoes, opcoes) {
 
 async function bubblePorId(tipo, id) {
   if (!texto(id)) return null;
-  const resposta = await fetch(BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id), {
-    headers: cabecalhosBubble()
-  });
+  const resposta = await buscar(
+    BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id),
+    { headers: cabecalhosBubble() },
+    'Bubble ler ' + tipo
+  );
   if (resposta.status === 404) return null;
   if (!resposta.ok) {
     const detalhe = await resposta.text();
@@ -231,11 +292,11 @@ async function bubblePorId(tipo, id) {
 }
 
 async function bubbleCriar(tipo, objecto) {
-  const resposta = await fetch(BUBBLE_BASE + '/' + tipo, {
+  const resposta = await buscar(BUBBLE_BASE + '/' + tipo, {
     method: 'POST',
     headers: cabecalhosBubble(),
     body: JSON.stringify(objecto)
-  });
+  }, 'Bubble criar ' + tipo);
   if (!resposta.ok) {
     const detalhe = await resposta.text();
     throw new Error('Bubble criar ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
@@ -245,11 +306,11 @@ async function bubbleCriar(tipo, objecto) {
 }
 
 async function bubbleActualizar(tipo, id, objecto) {
-  const resposta = await fetch(BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id), {
+  const resposta = await buscar(BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id), {
     method: 'PATCH',
     headers: cabecalhosBubble(),
     body: JSON.stringify(objecto)
-  });
+  }, 'Bubble actualizar ' + tipo);
   if (!resposta.ok) {
     const detalhe = await resposta.text();
     throw new Error('Bubble actualizar ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
@@ -271,14 +332,14 @@ async function enviarEmail(para, assunto, html) {
     return false;
   }
   try {
-    const resposta = await fetch('https://api.resend.com/emails', {
+    const resposta = await buscar('https://api.resend.com/emails', {
       method: 'POST',
       headers: {
         'Authorization': 'Bearer ' + RESEND_KEY,
         'Content-Type': 'application/json'
       },
       body: JSON.stringify({ from: MAIL_FROM, to: [para], subject: assunto, html: html })
-    });
+    }, 'Resend');
     if (!resposta.ok) {
       log('Resend recusou:', await resposta.text());
       return false;
@@ -383,11 +444,11 @@ async function cobrarCarteira(metodo, numeroCliente, nomeCliente, valorMZN) {
   let bruto = '';
 
   try {
-    const resposta = await fetch(MOPAY_BASE + caminho, {
+    const resposta = await buscar(MOPAY_BASE + caminho, {
       method: 'POST',
       headers: { 'Content-Type': 'application/json' },
       body: JSON.stringify(corpo)
-    });
+    }, 'MoPayment');
     bruto = await resposta.text();
     try { dados = JSON.parse(bruto); } catch (e) { dados = null; }
   } catch (e) {
@@ -414,13 +475,13 @@ async function streamCriarVideo(titulo) {
   if (!STREAM_LIBRARY || !STREAM_KEY) {
     throw new Error('Bunny Stream nao esta configurado no container');
   }
-  const resposta = await fetch('https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos', {
+  const resposta = await buscar('https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos', {
     method: 'POST',
     headers: { 'AccessKey': STREAM_KEY, 'Content-Type': 'application/json' },
     body: JSON.stringify({ title: texto(titulo).slice(0, 200) || 'Sem titulo' })
-  });
+  }, 'Bunny Stream criar video');
   if (!resposta.ok) {
-    throw new Error('Bunny Stream recusou criar o video: ' + (await resposta.text()).slice(0, 300));
+    throw new Error('Bunny Stream recusou criar o video (' + resposta.status + '): ' + (await resposta.text()).slice(0, 300));
   }
   const dados = await resposta.json();
   return texto(dados.guid);
@@ -437,9 +498,10 @@ function streamAssinatura(idVideo, validade) {
 }
 
 async function streamEstado(idVideo) {
-  const resposta = await fetch(
+  const resposta = await buscar(
     'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
-    { headers: { 'AccessKey': STREAM_KEY } }
+    { headers: { 'AccessKey': STREAM_KEY } },
+    'Bunny Stream estado'
   );
   if (!resposta.ok) return null;
   return await resposta.json();
@@ -448,9 +510,10 @@ async function streamEstado(idVideo) {
 async function streamApagarVideo(idVideo) {
   if (!idVideo || !STREAM_LIBRARY || !STREAM_KEY) return false;
   try {
-    const resposta = await fetch(
+    const resposta = await buscar(
       'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
-      { method: 'DELETE', headers: { 'AccessKey': STREAM_KEY } }
+      { method: 'DELETE', headers: { 'AccessKey': STREAM_KEY } },
+      'Bunny Stream apagar'
     );
     return resposta.ok;
   } catch (e) {
@@ -472,31 +535,39 @@ function urlMiniatura(idVideo) {
 /* Envia bytes para o Bunny Storage e devolve o endereco publico. */
 
 async function storageGuardar(caminho, bytes, tipoMime) {
-  if (!STORAGE_ZONE || !STORAGE_PASSWORD) {
-    throw new Error('Bunny Storage nao esta configurado no container');
-  }
+  if (!STORAGE_ZONE) throw new Error('STORAGE_ZONE em falta no container');
+  if (!STORAGE_PASSWORD) throw new Error('STORAGE_PASSWORD em falta no container');
+  if (!CDN_HOST) throw new Error('CDN_HOST em falta no container');
+
   const url = 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho;
-  const resposta = await fetch(url, {
+
+  const resposta = await buscar(url, {
     method: 'PUT',
     headers: {
       'AccessKey': STORAGE_PASSWORD,
       'Content-Type': tipoMime || 'application/octet-stream'
     },
     body: bytes
-  });
+  }, 'Bunny Storage guardar');
+
   if (!resposta.ok) {
-    throw new Error('Bunny Storage recusou (' + resposta.status + '): ' + (await resposta.text()).slice(0, 200));
+    const detalhe = (await resposta.text()).slice(0, 200);
+    if (resposta.status === 401) {
+      throw new Error('Bunny Storage recusou a chave (401). Confirme a STORAGE_PASSWORD — tem de ser a password da zona curc, nao a chave da conta.');
+    }
+    throw new Error('Bunny Storage recusou (' + resposta.status + '): ' + detalhe);
   }
+
   return 'https://' + CDN_HOST + '/' + caminho;
 }
 
 async function storageApagar(caminho) {
   if (!caminho || !STORAGE_ZONE) return false;
   try {
-    const resposta = await fetch('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho, {
+    const resposta = await buscar('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho, {
       method: 'DELETE',
       headers: { 'AccessKey': STORAGE_PASSWORD }
-    });
+    }, 'Bunny Storage apagar');
     return resposta.ok;
   } catch (e) {
     return false;
@@ -682,6 +753,121 @@ rotas['POST /diag'] = async function (req, res, corpo) {
     }
   }
   ok(res, { versao: VERSAO, tipos: relatorio });
+};
+
+/* ---------- diagnostico do Bunny Storage e Stream ---------- */
+
+/* Nunca devolve a password. So o tamanho, o principio e o fim,
+   que chega para perceber se foi cortada ou colada torta. */
+
+function retrato(nome, valorBruto, valorLimpo) {
+  const bruto = valorBruto === undefined || valorBruto === null ? '' : String(valorBruto);
+  return {
+    variavel: nome,
+    definida: bruto.length > 0,
+    tamanho_bruto: bruto.length,
+    tamanho_limpo: valorLimpo.length,
+    foi_limpo: bruto !== valorLimpo,
+    tinha_espacos: /^\s|\s$/.test(bruto),
+    tinha_aspas: /^["']|["']$/.test(bruto.trim()),
+    tinha_esquema: /^https?:\/\//i.test(bruto.trim()),
+    inicio: valorLimpo.slice(0, 4),
+    fim: valorLimpo.length > 8 ? valorLimpo.slice(-4) : ''
+  };
+}
+
+rotas['POST /diag-storage'] = async function (req, res, corpo) {
+  if (texto(corpo.key) !== UPLOAD_SECRET || !UPLOAD_SECRET) {
+    return erro(res, 'chave invalida', 403);
+  }
+
+  const relatorio = {
+    versao: VERSAO,
+    variaveis: [
+      retrato('STORAGE_ZONE', process.env.STORAGE_ZONE, STORAGE_ZONE),
+      retrato('STORAGE_PASSWORD', process.env.STORAGE_PASSWORD, STORAGE_PASSWORD),
+      retrato('STORAGE_HOST', process.env.STORAGE_HOST, STORAGE_HOST),
+      retrato('CDN_HOST', process.env.CDN_HOST, CDN_HOST),
+      retrato('STREAM_LIBRARY', process.env.STREAM_LIBRARY, STREAM_LIBRARY),
+      retrato('STREAM_KEY', process.env.STREAM_KEY, STREAM_KEY),
+      retrato('STREAM_CDN', process.env.STREAM_CDN, STREAM_CDN)
+    ],
+    url_que_vai_ser_usado: 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/<ficheiro>',
+    passos: {}
+  };
+
+  /* 1. o nome resolve? */
+  try {
+    const achado = await dns.lookup(STORAGE_HOST);
+    relatorio.passos['1_dns'] = 'ok — ' + STORAGE_HOST + ' = ' + achado.address;
+  } catch (e) {
+    relatorio.passos['1_dns'] = 'FALHOU — ' + (e.code || e.message) +
+      '. O container nao consegue resolver este nome. Confirme a STORAGE_HOST.';
+    return ok(res, relatorio);
+  }
+
+  /* 2. escrever mesmo um ficheiro */
+  const caminhoTeste = 'diagnostico/teste-' + Date.now() + '.txt';
+  const urlTeste = 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminhoTeste;
+
+  try {
+    const resposta = await fetch(urlTeste, {
+      method: 'PUT',
+      headers: { 'AccessKey': STORAGE_PASSWORD, 'Content-Type': 'text/plain' },
+      body: Buffer.from('curc diagnostico ' + agora())
+    });
+    const detalhe = (await resposta.text()).slice(0, 300);
+    relatorio.passos['2_escrita'] = resposta.status + ' — ' + (detalhe || '(sem corpo)');
+
+    if (resposta.status === 401) {
+      relatorio.passos['2_leitura'] = 'a chave nao serve — use a Password da zona curc (FTP & API Access), nao a API Key da conta';
+    }
+    if (resposta.status === 404) {
+      relatorio.passos['2_leitura'] = 'a zona "' + STORAGE_ZONE + '" nao existe neste host — confirme o nome e a regiao';
+    }
+  } catch (e) {
+    relatorio.passos['2_escrita'] = 'REBENTOU — ' + causaDe(e);
+    return ok(res, relatorio);
+  }
+
+  /* 3. ler de volta pelo CDN */
+  if (CDN_HOST) {
+    try {
+      const resposta = await fetch('https://' + CDN_HOST + '/' + caminhoTeste);
+      relatorio.passos['3_cdn'] = resposta.status + ' — https://' + CDN_HOST + '/' + caminhoTeste;
+    } catch (e) {
+      relatorio.passos['3_cdn'] = 'REBENTOU — ' + causaDe(e);
+    }
+  } else {
+    relatorio.passos['3_cdn'] = 'CDN_HOST em falta — o upload ate podia funcionar, mas o URL devolvido ficava partido';
+  }
+
+  /* 4. limpar */
+  try {
+    await fetch(urlTeste, { method: 'DELETE', headers: { 'AccessKey': STORAGE_PASSWORD } });
+    relatorio.passos['4_limpeza'] = 'ficheiro de teste apagado';
+  } catch (e) {
+    relatorio.passos['4_limpeza'] = 'ficou la o ficheiro de teste: ' + caminhoTeste;
+  }
+
+  /* 5. o Stream tambem */
+  if (STREAM_LIBRARY && STREAM_KEY) {
+    try {
+      const resposta = await fetch(
+        'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos?page=1&itemsPerPage=1',
+        { headers: { 'AccessKey': STREAM_KEY } }
+      );
+      relatorio.passos['5_stream'] = resposta.status === 200
+        ? 'ok — biblioteca ' + STREAM_LIBRARY + ' responde'
+        : resposta.status + ' — ' + (await resposta.text()).slice(0, 200);
+    } catch (e) {
+      relatorio.passos['5_stream'] = 'REBENTOU — ' + causaDe(e);
+    }
+  } else {
+    relatorio.passos['5_stream'] = 'STREAM_LIBRARY ou STREAM_KEY em falta';
+  }
+
+  ok(res, relatorio);
 };
 
 /* ---------- contas ---------- */
@@ -1734,5 +1920,8 @@ const servidor = http.createServer(async function (req, res) {
 servidor.listen(PORTA, function () {
   log('curc-proxy', VERSAO, 'a ouvir na porta', PORTA);
   log('Bubble:', BUBBLE_BASE || '(nao configurado)');
+  log('Storage:', STORAGE_ZONE ? (STORAGE_HOST + '/' + STORAGE_ZONE) : '(nao configurado)');
+  log('CDN:', CDN_HOST || '(nao configurado)');
+  log('Stream:', STREAM_LIBRARY || '(nao configurado)');
   log('Comissao:', COMISSAO_PCT + '%');
 });
