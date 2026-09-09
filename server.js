@@ -17,7 +17,7 @@
 const http = require('http');
 const crypto = require('crypto');
 
-const VERSAO = 'curc-1';
+const VERSAO = 'curc-2';
 const PORTA = process.env.PORT || 3000;
 
 /* ---------- variaveis de ambiente ---------- */
@@ -35,6 +35,17 @@ const MAIL_FROM = process.env.MAIL_FROM || 'CURC <noreply@curc.co.mz>';
 
 const APP_URL = process.env.APP_URL || '';
 const UPLOAD_SECRET = process.env.UPLOAD_SECRET || '';
+
+/* Bunny Storage — capas dos cursos, fotos e anexos */
+const STORAGE_ZONE = process.env.STORAGE_ZONE || '';
+const STORAGE_PASSWORD = process.env.STORAGE_PASSWORD || '';
+const STORAGE_HOST = process.env.STORAGE_HOST || 'storage.bunnycdn.com';
+const CDN_HOST = process.env.CDN_HOST || '';
+
+/* Bunny Stream — videos das aulas e de introducao */
+const STREAM_LIBRARY = process.env.STREAM_LIBRARY || '';
+const STREAM_KEY = process.env.STREAM_KEY || '';
+const STREAM_CDN = process.env.STREAM_CDN || '';
 
 /* ---------- nomes dos data types no Bubble ---------- */
 /* O Bubble aceita o nome do tipo em minusculas, sem espacos. */
@@ -90,13 +101,14 @@ function erro(res, mensagem, codigo) {
   responder(res, codigo || 400, { ok: false, erro: mensagem });
 }
 
-function lerCorpo(req) {
+function lerCorpo(req, limiteMB) {
+  const limite = (limiteMB || 2) * 1024 * 1024;
   return new Promise((resolve, reject) => {
     let bruto = '';
     let tamanho = 0;
     req.on('data', function (pedaco) {
       tamanho += pedaco.length;
-      if (tamanho > 2 * 1024 * 1024) {
+      if (tamanho > limite) {
         reject(new Error('corpo demasiado grande'));
         req.destroy();
         return;
@@ -392,6 +404,113 @@ async function cobrarCarteira(metodo, numeroCliente, nomeCliente, valorMZN) {
 }
 
 /* ============================================================
+   4B. BUNNY — STREAM E STORAGE
+   ============================================================ */
+
+/* Cria o registo do video no Bunny Stream e devolve o guid.
+   O ficheiro em si sobe depois, do browser, por TUS. */
+
+async function streamCriarVideo(titulo) {
+  if (!STREAM_LIBRARY || !STREAM_KEY) {
+    throw new Error('Bunny Stream nao esta configurado no container');
+  }
+  const resposta = await fetch('https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos', {
+    method: 'POST',
+    headers: { 'AccessKey': STREAM_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify({ title: texto(titulo).slice(0, 200) || 'Sem titulo' })
+  });
+  if (!resposta.ok) {
+    throw new Error('Bunny Stream recusou criar o video: ' + (await resposta.text()).slice(0, 300));
+  }
+  const dados = await resposta.json();
+  return texto(dados.guid);
+}
+
+/* Assinatura que o browser usa para subir por TUS.
+   sha256(biblioteca + chave + validade + id do video) */
+
+function streamAssinatura(idVideo, validade) {
+  return crypto
+    .createHash('sha256')
+    .update(STREAM_LIBRARY + STREAM_KEY + validade + idVideo)
+    .digest('hex');
+}
+
+async function streamEstado(idVideo) {
+  const resposta = await fetch(
+    'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
+    { headers: { 'AccessKey': STREAM_KEY } }
+  );
+  if (!resposta.ok) return null;
+  return await resposta.json();
+}
+
+async function streamApagarVideo(idVideo) {
+  if (!idVideo || !STREAM_LIBRARY || !STREAM_KEY) return false;
+  try {
+    const resposta = await fetch(
+      'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
+      { method: 'DELETE', headers: { 'AccessKey': STREAM_KEY } }
+    );
+    return resposta.ok;
+  } catch (e) {
+    log('Falhou apagar video', idVideo, e.message);
+    return false;
+  }
+}
+
+function urlPlayback(idVideo) {
+  if (!idVideo || !STREAM_CDN) return '';
+  return 'https://' + STREAM_CDN + '/' + idVideo + '/playlist.m3u8';
+}
+
+function urlMiniatura(idVideo) {
+  if (!idVideo || !STREAM_CDN) return '';
+  return 'https://' + STREAM_CDN + '/' + idVideo + '/thumbnail.jpg';
+}
+
+/* Envia bytes para o Bunny Storage e devolve o endereco publico. */
+
+async function storageGuardar(caminho, bytes, tipoMime) {
+  if (!STORAGE_ZONE || !STORAGE_PASSWORD) {
+    throw new Error('Bunny Storage nao esta configurado no container');
+  }
+  const url = 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho;
+  const resposta = await fetch(url, {
+    method: 'PUT',
+    headers: {
+      'AccessKey': STORAGE_PASSWORD,
+      'Content-Type': tipoMime || 'application/octet-stream'
+    },
+    body: bytes
+  });
+  if (!resposta.ok) {
+    throw new Error('Bunny Storage recusou (' + resposta.status + '): ' + (await resposta.text()).slice(0, 200));
+  }
+  return 'https://' + CDN_HOST + '/' + caminho;
+}
+
+async function storageApagar(caminho) {
+  if (!caminho || !STORAGE_ZONE) return false;
+  try {
+    const resposta = await fetch('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho, {
+      method: 'DELETE',
+      headers: { 'AccessKey': STORAGE_PASSWORD }
+    });
+    return resposta.ok;
+  } catch (e) {
+    return false;
+  }
+}
+
+const IMAGENS_ACEITES = {
+  'image/jpeg': 'jpg',
+  'image/jpg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp'
+};
+
+/* ============================================================
    5. REGRAS DE NEGOCIO
    ============================================================ */
 
@@ -449,6 +568,45 @@ async function creditarFormador(idFormador, liquido) {
   });
 }
 
+/* Confirma que o curso existe e que quem pede e mesmo o dono.
+   Devolve o curso, ou lanca um erro com o motivo. */
+
+async function cursoDoFormador(idDono, idCurso) {
+  if (!idDono) throw new Error('owner em falta');
+  if (!idCurso) throw new Error('curso em falta');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) throw new Error('curso nao encontrado');
+  if (texto(curso['Formador']) !== idDono) throw new Error('este curso nao e seu');
+
+  return curso;
+}
+
+async function formadorActivo(idDono) {
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) throw new Error('utilizador nao encontrado');
+  if (!utilizador['Formador Aprovado']) throw new Error('a sua conta ainda nao e de formador');
+  return utilizador;
+}
+
+/* Recalcula o total de aulas e a duracao a partir das aulas vivas. */
+
+async function recontarCurso(idCurso) {
+  const aulas = await bubbleTodos(T.aula, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1000 });
+
+  const vivas = aulas.filter(function (a) { return !a['Is Deleted']; });
+  const duracao = vivas.reduce(function (soma, a) { return soma + numero(a['Duracao Segundos']); }, 0);
+
+  await bubbleActualizar(T.curso, idCurso, {
+    'Total Aulas': vivas.length,
+    'Duracao Segundos': duracao
+  });
+
+  return { aulas: vivas.length, duracao: duracao };
+}
+
 function cursoPublico(curso) {
   return {
     id: curso._id,
@@ -502,6 +660,8 @@ rotas['GET /'] = async function (req, res) {
     hora: agora(),
     bubble: BUBBLE_BASE ? 'configurado' : 'em falta',
     carteira: MOZ_WALLET ? 'configurada' : 'em falta',
+    storage: (STORAGE_ZONE && STORAGE_PASSWORD && CDN_HOST) ? 'configurado' : 'em falta',
+    stream: (STREAM_LIBRARY && STREAM_KEY && STREAM_CDN) ? 'configurado' : 'em falta',
     comissao_pct: COMISSAO_PCT
   });
 };
@@ -965,6 +1125,572 @@ rotas['POST /my-courses'] = async function (req, res, corpo) {
 };
 
 /* ============================================================
+   6B. ESTUDIO DO FORMADOR
+   ============================================================ */
+
+rotas['POST /become-instructor'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  if (!idDono) return erro(res, 'owner em falta');
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+  if (!utilizador['Token Confirmado']) return erro(res, 'confirme primeiro o seu email');
+
+  if (utilizador['Formador Aprovado']) {
+    return ok(res, { formador: true, ja: true });
+  }
+
+  await bubbleActualizar(T.user, idDono, {
+    'Papel': 'Formador',
+    'Formador Aprovado': true,
+    'Bio': texto(corpo.bio) || texto(utilizador['Bio']),
+    'Telefone': texto(corpo.telefone) || texto(utilizador['Telefone'])
+  });
+
+  ok(res, { formador: true, ja: false });
+};
+
+rotas['POST /studio-courses'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  if (!idDono) return erro(res, 'owner em falta');
+
+  const cursos = await bubbleTodos(T.curso, [
+    restricao('Formador', 'equals', idDono)
+  ], { maximo: 500 });
+
+  const vivos = cursos.filter(function (c) { return !c['Is Deleted']; });
+
+  ok(res, {
+    cursos: vivos.map(function (c) {
+      const publico = cursoPublico(c);
+      publico.estado = texto(c['Estado']) || 'Rascunho';
+      publico.tem_intro = !!texto(c['Intro Video ID']);
+      publico.criado = c['Created Date'] || null;
+      return publico;
+    })
+  });
+};
+
+rotas['POST /studio-stats'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  if (!idDono) return erro(res, 'owner em falta');
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+
+  const cursos = (await bubbleTodos(T.curso, [
+    restricao('Formador', 'equals', idDono)
+  ], { maximo: 500 })).filter(function (c) { return !c['Is Deleted']; });
+
+  const inscricoes = await bubbleTodos(T.inscricao, [
+    restricao('Formador', 'equals', idDono)
+  ], { maximo: 2000 });
+
+  const alunosUnicos = new Set(inscricoes.map(function (i) { return texto(i['Aluno']); }));
+
+  const publicados = cursos.filter(function (c) { return texto(c['Estado']) === 'Publicado'; });
+
+  ok(res, {
+    saldo: numero(utilizador['Saldo MZN']),
+    total_ganho: numero(utilizador['Total Ganho MZN']),
+    cursos_total: cursos.length,
+    cursos_publicados: publicados.length,
+    alunos: alunosUnicos.size,
+    inscricoes: inscricoes.length,
+    comissao_pct: COMISSAO_PCT
+  });
+};
+
+rotas['POST /course-save'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+
+  await formadorActivo(idDono);
+
+  /* Ao editar, quem nao vem no pedido fica como estava.
+     Sem isto, gravar so o titulo apagava a descricao. */
+  const anterior = idCurso ? await cursoDoFormador(idDono, idCurso) : {};
+
+  function veio(chave) {
+    return Object.prototype.hasOwnProperty.call(corpo, chave);
+  }
+
+  const titulo = veio('titulo') ? texto(corpo.titulo) : texto(anterior['Titulo']);
+  if (!titulo) return erro(res, 'o curso precisa de um titulo');
+
+  const gratis = veio('gratis') ? corpo.gratis === true : !!anterior['E Gratis'];
+  const preco = gratis ? 0
+    : (veio('preco') ? Math.max(0, Math.round(numero(corpo.preco))) : numero(anterior['Preco MZN']));
+  const promo = gratis ? 0
+    : (veio('preco_promo') ? Math.max(0, Math.round(numero(corpo.preco_promo))) : numero(anterior['Preco Promo MZN']));
+
+  if (!gratis && preco <= 0) {
+    return erro(res, 'defina um preco, ou marque o curso como gratuito');
+  }
+  if (promo > 0 && promo >= preco) {
+    return erro(res, 'o preco promocional tem de ser inferior ao normal');
+  }
+
+  const campos = {
+    'Titulo': titulo,
+    'Preco MZN': preco,
+    'Preco Promo MZN': promo,
+    'E Gratis': gratis
+  };
+
+  if (veio('subtitulo')) campos['Subtitulo'] = texto(corpo.subtitulo).slice(0, 200);
+  if (veio('descricao')) campos['Descricao'] = texto(corpo.descricao);
+  if (veio('categoria')) campos['Categoria'] = texto(corpo.categoria);
+  if (veio('nivel')) campos['Nivel'] = texto(corpo.nivel) || 'Iniciante';
+  if (veio('certificado')) campos['Tem Certificado'] = corpo.certificado === true;
+
+  if (Array.isArray(corpo.aprende)) {
+    campos['O Que Vai Aprender'] = corpo.aprende.map(texto).filter(Boolean).slice(0, 12);
+  }
+  if (Array.isArray(corpo.requisitos)) {
+    campos['Requisitos'] = corpo.requisitos.map(texto).filter(Boolean).slice(0, 12);
+  }
+
+  if (idCurso) {
+    await bubbleActualizar(T.curso, idCurso, campos);
+    return ok(res, { curso: idCurso, novo: false });
+  }
+
+  if (!campos['Nivel']) campos['Nivel'] = 'Iniciante';
+  campos['Formador'] = idDono;
+  campos['Slug'] = slugificar(titulo) + '-' + codigoAleatorio(4).toLowerCase();
+  campos['Estado'] = 'Rascunho';
+  campos['Total Aulas'] = 0;
+  campos['Total Alunos'] = 0;
+  campos['Duracao Segundos'] = 0;
+  campos['Media Estrelas'] = 0;
+  campos['Total Avaliacoes'] = 0;
+  campos['Is Deleted'] = false;
+
+  const novo = await bubbleCriar(T.curso, campos);
+  ok(res, { curso: novo, novo: true, slug: campos['Slug'] });
+};
+
+rotas['POST /course-publish'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+
+  const curso = await cursoDoFormador(idDono, idCurso);
+
+  /* Validacoes antes de deixar publicar. */
+  const faltas = [];
+  if (!texto(curso['Titulo'])) faltas.push('titulo');
+  if (!texto(curso['Descricao'])) faltas.push('descricao');
+  if (!texto(curso['Categoria'])) faltas.push('categoria');
+  if (!texto(curso['Capa URL'])) faltas.push('imagem de capa');
+  if (!texto(curso['Intro Video ID'])) faltas.push('video de introducao');
+
+  const contagem = await recontarCurso(idCurso);
+  if (contagem.aulas < 1) faltas.push('pelo menos uma aula');
+
+  if (faltas.length) {
+    return erro(res, 'falta: ' + faltas.join(', '));
+  }
+
+  await bubbleActualizar(T.curso, idCurso, {
+    'Estado': 'Publicado',
+    'Publicado Data': agora()
+  });
+
+  const formador = await bubblePorId(T.user, idDono);
+  const publicados = (await bubbleTodos(T.curso, [
+    restricao('Formador', 'equals', idDono),
+    restricao('Estado', 'equals', 'Publicado')
+  ], { maximo: 500 })).filter(function (c) { return !c['Is Deleted']; });
+
+  if (formador) {
+    await bubbleActualizar(T.user, idDono, { 'Total Cursos': publicados.length });
+  }
+
+  ok(res, { publicado: true, aulas: contagem.aulas, duracao: contagem.duracao });
+};
+
+rotas['POST /course-unpublish'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  await cursoDoFormador(idDono, idCurso);
+
+  await bubbleActualizar(T.curso, idCurso, { 'Estado': 'Rascunho' });
+  ok(res, { publicado: false });
+};
+
+rotas['POST /course-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const curso = await cursoDoFormador(idDono, idCurso);
+
+  if (numero(curso['Total Alunos']) > 0) {
+    return erro(res, 'este curso ja tem alunos inscritos e nao pode ser apagado');
+  }
+
+  await bubbleActualizar(T.curso, idCurso, {
+    'Is Deleted': true,
+    'Estado': 'Suspenso'
+  });
+
+  ok(res, { apagado: true });
+};
+
+/* ---------- modulos ---------- */
+
+rotas['POST /module-save'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idModulo = texto(corpo.modulo);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const nome = texto(corpo.nome);
+  if (!nome) return erro(res, 'o modulo precisa de um nome');
+
+  if (idModulo) {
+    const modulo = await bubblePorId(T.modulo, idModulo);
+    if (!modulo || texto(modulo['Curso']) !== idCurso) return erro(res, 'modulo nao encontrado', 404);
+    await bubbleActualizar(T.modulo, idModulo, { 'Nome': nome });
+    return ok(res, { modulo: idModulo, novo: false });
+  }
+
+  const existentes = await bubbleTodos(T.modulo, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 200 });
+
+  const novo = await bubbleCriar(T.modulo, {
+    'Curso': idCurso,
+    'Nome': nome,
+    'Ordem': existentes.filter(function (m) { return !m['Is Deleted']; }).length + 1,
+    'Is Deleted': false
+  });
+
+  ok(res, { modulo: novo, novo: true });
+};
+
+rotas['POST /module-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idModulo = texto(corpo.modulo);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const aulas = (await bubbleTodos(T.aula, [
+    restricao('Modulo', 'equals', idModulo)
+  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
+
+  if (aulas.length) {
+    return erro(res, 'apague primeiro as ' + aulas.length + ' aulas deste modulo');
+  }
+
+  await bubbleActualizar(T.modulo, idModulo, { 'Is Deleted': true });
+  ok(res, { apagado: true });
+};
+
+/* ---------- aulas ---------- */
+
+rotas['POST /lesson-save'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idAula = texto(corpo.aula);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const titulo = texto(corpo.titulo);
+  if (!titulo) return erro(res, 'a aula precisa de um titulo');
+
+  const tipo = texto(corpo.tipo) || 'Video';
+  if (['Video', 'Texto', 'Ficheiro', 'Live'].indexOf(tipo) === -1) {
+    return erro(res, 'tipo de aula desconhecido');
+  }
+
+  const campos = { 'Titulo': titulo };
+
+  function veioAula(chave) {
+    return Object.prototype.hasOwnProperty.call(corpo, chave);
+  }
+
+  if (veioAula('descricao')) campos['Descricao'] = texto(corpo.descricao);
+  if (veioAula('tipo')) campos['Tipo'] = tipo;
+  if (veioAula('texto')) campos['Texto'] = texto(corpo.texto);
+  if (veioAula('livre')) campos['E Livre'] = corpo.livre === true;
+
+  if (idAula) {
+    const aula = await bubblePorId(T.aula, idAula);
+    if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+    if (texto(corpo.modulo)) campos['Modulo'] = texto(corpo.modulo);
+    await bubbleActualizar(T.aula, idAula, campos);
+    await recontarCurso(idCurso);
+    return ok(res, { aula: idAula, novo: false });
+  }
+
+  const idModulo = texto(corpo.modulo);
+  if (!idModulo) return erro(res, 'escolha o modulo da aula');
+
+  const irmas = (await bubbleTodos(T.aula, [
+    restricao('Modulo', 'equals', idModulo)
+  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
+
+  campos['Curso'] = idCurso;
+  campos['Modulo'] = idModulo;
+  campos['Tipo'] = tipo;
+  campos['Ordem'] = irmas.length + 1;
+  campos['Duracao Segundos'] = 0;
+  campos['Is Deleted'] = false;
+  if (!veioAula('livre')) campos['E Livre'] = false;
+
+  const novo = await bubbleCriar(T.aula, campos);
+  await recontarCurso(idCurso);
+
+  ok(res, { aula: novo, novo: true });
+};
+
+rotas['POST /lesson-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idAula = texto(corpo.aula);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const aula = await bubblePorId(T.aula, idAula);
+  if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+
+  await streamApagarVideo(texto(aula['Bunny Video ID']));
+  await bubbleActualizar(T.aula, idAula, { 'Is Deleted': true });
+  const contagem = await recontarCurso(idCurso);
+
+  ok(res, { apagado: true, aulas: contagem.aulas });
+};
+
+rotas['POST /reorder'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const alvo = texto(corpo.tipo);
+  const ids = Array.isArray(corpo.ids) ? corpo.ids.map(texto).filter(Boolean) : [];
+
+  await cursoDoFormador(idDono, idCurso);
+
+  if (alvo !== 'modulo' && alvo !== 'aula') return erro(res, 'tipo deve ser modulo ou aula');
+  if (!ids.length) return erro(res, 'lista de ids vazia');
+
+  const tabela = alvo === 'modulo' ? T.modulo : T.aula;
+
+  for (let i = 0; i < ids.length; i++) {
+    const registo = await bubblePorId(tabela, ids[i]);
+    if (!registo || texto(registo['Curso']) !== idCurso) continue;
+    await bubbleActualizar(tabela, ids[i], { 'Ordem': i + 1 });
+  }
+
+  ok(res, { ordenados: ids.length });
+};
+
+/* ---------- video: autorizacao para o TUS ---------- */
+
+rotas['POST /video-token'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const alvo = texto(corpo.alvo) || 'aula';
+
+  await cursoDoFormador(idDono, idCurso);
+
+  if (alvo !== 'aula' && alvo !== 'intro') return erro(res, 'alvo deve ser aula ou intro');
+
+  let idAula = '';
+  if (alvo === 'aula') {
+    idAula = texto(corpo.aula);
+    if (!idAula) return erro(res, 'aula em falta');
+    const aula = await bubblePorId(T.aula, idAula);
+    if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+    /* Se ja tinha video, apaga o antigo para nao deixar lixo a pagar. */
+    await streamApagarVideo(texto(aula['Bunny Video ID']));
+  } else {
+    const curso = await bubblePorId(T.curso, idCurso);
+    await streamApagarVideo(texto(curso['Intro Video ID']));
+  }
+
+  const titulo = texto(corpo.titulo) || (alvo === 'intro' ? 'Introducao' : 'Aula');
+  const idVideo = await streamCriarVideo(titulo);
+
+  /* Duas horas chega para qualquer envio, mesmo com rede fraca. */
+  const validade = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
+
+  ok(res, {
+    video_id: idVideo,
+    biblioteca: STREAM_LIBRARY,
+    assinatura: streamAssinatura(idVideo, validade),
+    validade: validade,
+    endpoint: 'https://video.bunnycdn.com/tusupload',
+    alvo: alvo,
+    aula: idAula
+  });
+};
+
+rotas['POST /video-done'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const alvo = texto(corpo.alvo) || 'aula';
+  const idVideo = texto(corpo.video_id);
+
+  await cursoDoFormador(idDono, idCurso);
+  if (!idVideo) return erro(res, 'video_id em falta');
+
+  const info = await streamEstado(idVideo);
+  const duracao = info ? numero(info.length) : 0;
+
+  if (alvo === 'intro') {
+    await bubbleActualizar(T.curso, idCurso, {
+      'Intro Video ID': idVideo,
+      'Intro Playback URL': urlPlayback(idVideo),
+      'Intro Thumbnail URL': urlMiniatura(idVideo),
+      'Intro Duracao': duracao
+    });
+    return ok(res, { guardado: 'intro', duracao: duracao });
+  }
+
+  const idAula = texto(corpo.aula);
+  const aula = await bubblePorId(T.aula, idAula);
+  if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+
+  await bubbleActualizar(T.aula, idAula, {
+    'Bunny Video ID': idVideo,
+    'Playback URL': urlPlayback(idVideo),
+    'Thumbnail URL': urlMiniatura(idVideo),
+    'Duracao Segundos': duracao,
+    'Estado Video': 'processing',
+    'Tipo': 'Video'
+  });
+
+  await recontarCurso(idCurso);
+  ok(res, { guardado: 'aula', duracao: duracao });
+};
+
+rotas['POST /video-status'] = async function (req, res, corpo) {
+  const idVideo = texto(corpo.video_id);
+  if (!idVideo) return erro(res, 'video_id em falta');
+
+  const info = await streamEstado(idVideo);
+  if (!info) return erro(res, 'video nao encontrado', 404);
+
+  /* Estados do Bunny: 0 em fila, 1 a processar, 2 a codificar,
+     3 terminado, 4 resolucoes prontas, 5 falhou. */
+  const codigo = numero(info.status);
+  const pronto = codigo >= 3 && codigo !== 5;
+
+  /* Assim que ficar pronto, guarda a duracao real na aula. */
+  const idAula = texto(corpo.aula);
+  if (pronto && idAula) {
+    const aula = await bubblePorId(T.aula, idAula);
+    if (aula && texto(aula['Bunny Video ID']) === idVideo) {
+      await bubbleActualizar(T.aula, idAula, {
+        'Estado Video': 'ready',
+        'Duracao Segundos': numero(info.length)
+      });
+      await recontarCurso(texto(aula['Curso']));
+    }
+  }
+
+  ok(res, {
+    estado: codigo,
+    pronto: pronto,
+    falhou: codigo === 5,
+    progresso: numero(info.encodeProgress),
+    duracao: numero(info.length)
+  });
+};
+
+/* ---------- imagens ---------- */
+
+rotas['POST /upload-image'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const alvo = texto(corpo.alvo) || 'capa';
+  const tipoMime = texto(corpo.mime).toLowerCase();
+  const base64 = texto(corpo.dados);
+
+  if (!idDono) return erro(res, 'owner em falta');
+  if (!base64) return erro(res, 'imagem em falta');
+
+  const extensao = IMAGENS_ACEITES[tipoMime];
+  if (!extensao) return erro(res, 'so aceito imagens jpg, png ou webp');
+
+  const bytes = Buffer.from(base64.replace(/^data:[^,]+,/, ''), 'base64');
+  if (!bytes.length) return erro(res, 'imagem vazia');
+  if (bytes.length > 5 * 1024 * 1024) return erro(res, 'imagem acima de 5 MB');
+
+  let caminho;
+
+  if (alvo === 'capa') {
+    const idCurso = texto(corpo.curso);
+    await cursoDoFormador(idDono, idCurso);
+    caminho = 'capas/' + idCurso + '-' + Date.now() + '.' + extensao;
+    const url = await storageGuardar(caminho, bytes, tipoMime);
+    await bubbleActualizar(T.curso, idCurso, { 'Capa URL': url });
+    return ok(res, { url: url });
+  }
+
+  if (alvo === 'perfil') {
+    caminho = 'perfis/' + idDono + '-' + Date.now() + '.' + extensao;
+    const url = await storageGuardar(caminho, bytes, tipoMime);
+    await bubbleActualizar(T.user, idDono, { 'Foto URL': url });
+    return ok(res, { url: url });
+  }
+
+  erro(res, 'alvo deve ser capa ou perfil');
+};
+
+/* ---------- ver o curso como dono, com tudo a descoberto ---------- */
+
+rotas['POST /studio-course'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+
+  const curso = await cursoDoFormador(idDono, idCurso);
+
+  const modulos = (await bubbleTodos(T.modulo, [
+    restricao('Curso', 'equals', idCurso)
+  ], { ordenarPor: 'Ordem', maximo: 200 })).filter(function (m) { return !m['Is Deleted']; });
+
+  const aulas = (await bubbleTodos(T.aula, [
+    restricao('Curso', 'equals', idCurso)
+  ], { ordenarPor: 'Ordem', maximo: 1000 })).filter(function (a) { return !a['Is Deleted']; });
+
+  ok(res, {
+    curso: Object.assign(cursoPublico(curso), {
+      descricao: texto(curso['Descricao']),
+      aprende: curso['O Que Vai Aprender'] || [],
+      requisitos: curso['Requisitos'] || [],
+      estado: texto(curso['Estado']) || 'Rascunho',
+      intro_video_id: texto(curso['Intro Video ID'])
+    }),
+    modulos: modulos.map(function (m) {
+      return {
+        id: m._id,
+        nome: texto(m['Nome']),
+        ordem: numero(m['Ordem']),
+        aulas: aulas
+          .filter(function (a) { return texto(a['Modulo']) === m._id; })
+          .map(function (a) {
+            return {
+              id: a._id,
+              titulo: texto(a['Titulo']),
+              descricao: texto(a['Descricao']),
+              tipo: texto(a['Tipo']),
+              texto: texto(a['Texto']),
+              ordem: numero(a['Ordem']),
+              livre: !!a['E Livre'],
+              video_id: texto(a['Bunny Video ID']),
+              playback: texto(a['Playback URL']),
+              thumb: texto(a['Thumbnail URL']),
+              duracao: numero(a['Duracao Segundos']),
+              estado_video: texto(a['Estado Video'])
+            };
+          })
+      };
+    })
+  });
+};
+
+/* ============================================================
    7. SERVIDOR
    ============================================================ */
 
@@ -991,7 +1717,7 @@ const servidor = http.createServer(async function (req, res) {
   let corpo = {};
   if (req.method === 'POST') {
     try {
-      corpo = await lerCorpo(req);
+      corpo = await lerCorpo(req, caminho === '/upload-image' ? 10 : 2);
     } catch (e) {
       return erro(res, e.message);
     }
