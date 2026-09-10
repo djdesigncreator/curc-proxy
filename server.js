@@ -1,9 +1,19 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-6
+   versao: curc-7
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - programa de afiliados. O dono do curso decide quanto da,
+       entre AFILIADO_MIN_PCT e AFILIADO_MAX_PCT. A parte do
+       afiliado sai do bolo do formador, nunca do da plataforma.
+     - POST /affiliate-link    gera ou devolve o link do afiliado
+     - POST /affiliate-hit     conta um clique (publica)
+     - POST /my-affiliates     os meus links e o que renderam
+     - POST /course-affiliates quem promove este curso (dono)
+     - /pay aceita ref e reparte a venda por tres
+
+   Da versao curc-6:
      - /signup-code atribui o plano gratuito, o nome e o papel
        logo no registo, para ninguem chegar ao estudio sem plano
 
@@ -34,7 +44,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-6';
+const VERSAO = 'curc-7';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -76,6 +86,11 @@ const MOPAY_BASE = limparUrl(process.env.MOPAY_BASE) || 'https://mozpayment.co.m
 
 const COMISSAO_PCT = Number(limparValor(process.env.COMISSAO_PCT) || 15);
 
+/* Quanto o formador pode dar ao afiliado. O minimo e obrigatorio:
+   quem liga os afiliados no seu curso tem de dar pelo menos isto. */
+const AFILIADO_MIN_PCT = Number(limparValor(process.env.AFILIADO_MIN_PCT) || 10);
+const AFILIADO_MAX_PCT = Number(limparValor(process.env.AFILIADO_MAX_PCT) || 50);
+
 const RESEND_KEY = limparValor(process.env.RESEND_KEY);
 const MAIL_FROM = limparValor(process.env.MAIL_FROM) || 'CURC <noreply@curc.co.mz>';
 
@@ -108,6 +123,7 @@ const T = {
   pagamento: 'payment',
   cartaoPendente: 'card_payment_pending',
   planoFormador: 'plano_formador',
+  afiliado: 'afiliado',
   levantamento: 'payout',
   avaliacao: 'review',
   duvida: 'question',
@@ -610,9 +626,80 @@ function precoEfectivo(curso) {
   return base;
 }
 
-function repartir(valorMZN) {
+/* A parte do afiliado sai do que sobra para o formador.
+   A plataforma leva sempre a mesma percentagem. */
+
+function repartir(valorMZN, pctAfiliado) {
   const comissao = Math.round(valorMZN * (COMISSAO_PCT / 100));
-  return { comissao: comissao, liquido: valorMZN - comissao };
+  const pct = Math.max(0, Math.min(AFILIADO_MAX_PCT, numero(pctAfiliado)));
+  const afiliado = pct > 0 ? Math.round(valorMZN * (pct / 100)) : 0;
+  const liquido = valorMZN - comissao - afiliado;
+
+  /* Rede de seguranca: se as contas nao fecharem, o formador
+     nunca sai a dever — o afiliado e que e cortado. */
+  if (liquido < 0) {
+    return { comissao: comissao, afiliado: Math.max(0, valorMZN - comissao), liquido: 0 };
+  }
+  return { comissao: comissao, afiliado: afiliado, liquido: liquido };
+}
+
+/* ---------- afiliados ---------- */
+
+function comissaoAfiliadoDe(curso) {
+  if (!curso['Aceita Afiliados']) return 0;
+  const pct = numero(curso['Comissao Afiliado Pct']);
+  if (pct <= 0) return 0;
+  return Math.max(AFILIADO_MIN_PCT, Math.min(AFILIADO_MAX_PCT, pct));
+}
+
+async function codigoLivre() {
+  for (let tentativa = 0; tentativa < 8; tentativa++) {
+    const codigo = codigoAleatorio(6);
+    const achados = await bubbleTodos(T.afiliado, [
+      restricao('Codigo', 'equals', codigo)
+    ], { maximo: 1 });
+    if (!achados.length) return codigo;
+  }
+  /* Oito colisoes seguidas nao acontecem, mas se acontecer
+     vale mais um codigo comprido do que um erro. */
+  return codigoAleatorio(10);
+}
+
+async function afiliadoPorCodigo(codigo) {
+  if (!texto(codigo)) return null;
+  const achados = await bubbleTodos(T.afiliado, [
+    restricao('Codigo', 'equals', texto(codigo).toUpperCase()),
+    restricao('Is Active', 'equals', true)
+  ], { maximo: 1 });
+  return achados[0] || null;
+}
+
+/* Confirma que este afiliado pode mesmo receber por esta venda. */
+
+function afiliadoVale(afiliado, curso, idComprador) {
+  if (!afiliado) return false;
+  if (texto(afiliado['Curso']) !== curso._id) return false;
+  if (texto(afiliado['Utilizador']) === idComprador) return false;   /* nao se auto-indica */
+  if (texto(afiliado['Utilizador']) === texto(curso['Formador'])) return false;
+  if (comissaoAfiliadoDe(curso) <= 0) return false;
+  return true;
+}
+
+async function creditarAfiliado(afiliado, valor) {
+  if (!afiliado || valor <= 0) return;
+
+  await bubbleActualizar(T.afiliado, afiliado._id, {
+    'Vendas': numero(afiliado['Vendas']) + 1,
+    'Ganho MZN': numero(afiliado['Ganho MZN']) + valor
+  });
+
+  const pessoa = await bubblePorId(T.user, texto(afiliado['Utilizador']));
+  if (!pessoa) return;
+
+  await bubbleActualizar(T.user, texto(afiliado['Utilizador']), {
+    'Saldo Afiliado MZN': numero(pessoa['Saldo Afiliado MZN']) + valor,
+    'Total Afiliado MZN': numero(pessoa['Total Afiliado MZN']) + valor
+  });
 }
 
 async function inscricaoDe(idAluno, idCurso) {
@@ -908,6 +995,8 @@ function cursoPublico(curso) {
     estrelas: numero(curso['Media Estrelas']),
     avaliacoes: numero(curso['Total Avaliacoes']),
     certificado: !!curso['Tem Certificado'],
+    aceita_afiliados: !!curso['Aceita Afiliados'],
+    comissao_afiliado: comissaoAfiliadoDe(curso),
     formador_id: texto(curso['Formador'])
   };
 }
@@ -941,7 +1030,9 @@ rotas['GET /'] = async function (req, res) {
     carteira: MOZ_WALLET ? 'configurada' : 'em falta',
     storage: (STORAGE_ZONE && STORAGE_PASSWORD && CDN_HOST) ? 'configurado' : 'em falta',
     stream: (STREAM_LIBRARY && STREAM_KEY && STREAM_CDN) ? 'configurado' : 'em falta',
-    comissao_pct: COMISSAO_PCT
+    comissao_pct: COMISSAO_PCT,
+    afiliado_min_pct: AFILIADO_MIN_PCT,
+    afiliado_max_pct: AFILIADO_MAX_PCT
   });
 };
 
@@ -1181,6 +1272,8 @@ rotas['POST /account'] = async function (req, res, corpo) {
     confirmado: !!utilizador['Token Confirmado'],
     saldo: numero(utilizador['Saldo MZN']),
     total_ganho: numero(utilizador['Total Ganho MZN']),
+    saldo_afiliado: numero(utilizador['Saldo Afiliado MZN']),
+    total_afiliado: numero(utilizador['Total Afiliado MZN']),
     total_cursos: numero(utilizador['Total Cursos']),
     inscricoes: inscricoes.length,
     comissao_pct: COMISSAO_PCT
@@ -1464,8 +1557,15 @@ rotas['POST /pay'] = async function (req, res, corpo) {
   }
 
   const nomeCliente = texto(aluno['Nome Completo']) || 'Cliente CURC';
+
+  /* Quem indicou esta venda, se alguem indicou. */
+  let afiliado = await afiliadoPorCodigo(corpo.ref);
+  if (afiliado && !afiliadoVale(afiliado, curso, idDono)) afiliado = null;
+
+  const pctAfiliado = afiliado ? comissaoAfiliadoDe(curso) : 0;
+
   const resultado = await cobrarCarteira(metodo, numeroLimpo, nomeCliente, valor);
-  const reparticao = repartir(valor);
+  const reparticao = repartir(valor, pctAfiliado);
 
   const idPagamento = await bubbleCriar(T.pagamento, {
     'User': idDono,
@@ -1481,7 +1581,10 @@ rotas['POST /pay'] = async function (req, res, corpo) {
     'Raw': resultado.bruto,
     'Formador': texto(curso['Formador']),
     'Comissao MZN': resultado.sucesso ? reparticao.comissao : 0,
-    'Liquido MZN': resultado.sucesso ? reparticao.liquido : 0
+    'Liquido MZN': resultado.sucesso ? reparticao.liquido : 0,
+    'Afiliado': afiliado ? texto(afiliado['Utilizador']) : '',
+    'Afiliado MZN': resultado.sucesso ? reparticao.afiliado : 0,
+    'Ref Codigo': afiliado ? texto(afiliado['Codigo']) : ''
   });
 
   if (!resultado.sucesso) {
@@ -1496,19 +1599,22 @@ rotas['POST /pay'] = async function (req, res, corpo) {
 
   const idInscricao = await criarInscricao(aluno, curso, 'compra', valor);
   await creditarFormador(texto(curso['Formador']), reparticao.liquido);
+  if (afiliado) await creditarAfiliado(afiliado, reparticao.afiliado);
 
   if (cupaoUsado) {
     await bubbleActualizar(T.cupao, cupaoUsado._id, { 'Usos': numero(cupaoUsado['Usos']) + 1 });
   }
 
-  log('Pagamento aceite', metodo, valor, 'MZN — curso', idItem);
+  log('Pagamento aceite', metodo, valor, 'MZN — curso', idItem,
+      afiliado ? '(afiliado ' + texto(afiliado['Codigo']) + ')' : '');
 
   ok(res, {
     pago: true,
     valor: valor,
     transacao: resultado.transacao,
     pagamento: idPagamento,
-    inscricao: idInscricao
+    inscricao: idInscricao,
+    afiliado: !!afiliado
   });
 };
 
@@ -1763,6 +1869,185 @@ rotas['POST /my-reviews'] = async function (req, res, corpo) {
   });
 
   ok(res, { avaliacoes: saida });
+};
+
+/* ============================================================
+   6C. AFILIADOS
+   ============================================================ */
+
+/* Gera, ou devolve, o link desta pessoa para este curso.
+   Qualquer pessoa com conta pode ser afiliada de qualquer
+   curso que aceite afiliados. */
+
+rotas['POST /affiliate-link'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
+
+  const pessoa = await bubblePorId(T.user, idDono);
+  if (!pessoa) return erro(res, 'utilizador nao encontrado', 404);
+  if (!pessoa['Token Confirmado']) return erro(res, 'confirme primeiro o seu email');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+  if (texto(curso['Estado']) !== 'Publicado') return erro(res, 'curso nao disponivel', 403);
+
+  const pct = comissaoAfiliadoDe(curso);
+  if (pct <= 0) return erro(res, 'este curso nao aceita afiliados');
+  if (texto(curso['Formador']) === idDono) return erro(res, 'este curso e seu');
+
+  const jaTem = await bubbleTodos(T.afiliado, [
+    restricao('Utilizador', 'equals', idDono),
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1 });
+
+  let registo = jaTem[0];
+
+  if (registo) {
+    /* Reactiva em silencio se tinha sido desligado. */
+    if (!registo['Is Active']) {
+      await bubbleActualizar(T.afiliado, registo._id, { 'Is Active': true });
+    }
+  } else {
+    const codigo = await codigoLivre();
+    const idNovo = await bubbleCriar(T.afiliado, {
+      'Utilizador': idDono,
+      'Curso': idCurso,
+      'Formador': texto(curso['Formador']),
+      'Codigo': codigo,
+      'Cliques': 0,
+      'Vendas': 0,
+      'Ganho MZN': 0,
+      'Is Active': true
+    });
+    registo = { _id: idNovo, 'Codigo': codigo, 'Cliques': 0, 'Vendas': 0, 'Ganho MZN': 0 };
+  }
+
+  const codigo = texto(registo['Codigo']);
+  const preco = precoEfectivo(curso);
+
+  ok(res, {
+    codigo: codigo,
+    curso: idCurso,
+    titulo: texto(curso['Titulo']),
+    comissao_pct: pct,
+    por_venda: Math.round(preco * (pct / 100)),
+    preco: preco,
+    cliques: numero(registo['Cliques']),
+    vendas: numero(registo['Vendas']),
+    ganho: numero(registo['Ganho MZN']),
+    caminho: '?curso=' + encodeURIComponent(idCurso) + '&ref=' + encodeURIComponent(codigo)
+  });
+};
+
+/* Conta um clique. Publica de proposito — quem visita o link
+   ainda nao tem sessao nenhuma. */
+
+rotas['POST /affiliate-hit'] = async function (req, res, corpo) {
+  const codigo = texto(corpo.ref).toUpperCase();
+  if (!codigo) return erro(res, 'ref em falta');
+
+  const afiliado = await afiliadoPorCodigo(codigo);
+  if (!afiliado) return ok(res, { contado: false });
+
+  await bubbleActualizar(T.afiliado, afiliado._id, {
+    'Cliques': numero(afiliado['Cliques']) + 1
+  });
+
+  ok(res, { contado: true, curso: texto(afiliado['Curso']) });
+};
+
+/* O painel de quem promove. */
+
+rotas['POST /my-affiliates'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  if (!idDono) return erro(res, 'owner em falta');
+
+  const pessoa = await bubblePorId(T.user, idDono);
+  if (!pessoa) return erro(res, 'utilizador nao encontrado', 404);
+
+  const meus = await bubbleTodos(T.afiliado, [
+    restricao('Utilizador', 'equals', idDono)
+  ], { maximo: 300 });
+
+  const linhas = [];
+  for (const a of meus) {
+    const curso = await bubblePorId(T.curso, texto(a['Curso']));
+    if (!curso || curso['Is Deleted']) continue;
+
+    const pct = comissaoAfiliadoDe(curso);
+    const preco = precoEfectivo(curso);
+
+    linhas.push({
+      id: a._id,
+      codigo: texto(a['Codigo']),
+      curso: curso._id,
+      titulo: texto(curso['Titulo']),
+      capa: texto(curso['Capa URL']),
+      publicado: texto(curso['Estado']) === 'Publicado',
+      aceita: pct > 0,
+      comissao_pct: pct,
+      preco: preco,
+      por_venda: Math.round(preco * (pct / 100)),
+      cliques: numero(a['Cliques']),
+      vendas: numero(a['Vendas']),
+      ganho: numero(a['Ganho MZN']),
+      activo: !!a['Is Active'],
+      caminho: '?curso=' + encodeURIComponent(curso._id) + '&ref=' + encodeURIComponent(texto(a['Codigo']))
+    });
+  }
+
+  linhas.sort(function (a, b) { return b.ganho - a.ganho || b.cliques - a.cliques; });
+
+  ok(res, {
+    links: linhas,
+    saldo: numero(pessoa['Saldo Afiliado MZN']),
+    total_ganho: numero(pessoa['Total Afiliado MZN']),
+    cliques: linhas.reduce(function (s, l) { return s + l.cliques; }, 0),
+    vendas: linhas.reduce(function (s, l) { return s + l.vendas; }, 0),
+    min_pct: AFILIADO_MIN_PCT,
+    max_pct: AFILIADO_MAX_PCT
+  });
+};
+
+/* Quem promove um curso meu, visto do lado do formador. */
+
+rotas['POST /course-affiliates'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+
+  const curso = await cursoDoFormador(idDono, idCurso);
+
+  const lista = await bubbleTodos(T.afiliado, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 500 });
+
+  const linhas = [];
+  for (const a of lista) {
+    const pessoa = await bubblePorId(T.user, texto(a['Utilizador']));
+    linhas.push({
+      nome: pessoa ? texto(pessoa['Nome Completo']) : 'Sem nome',
+      foto: pessoa ? texto(pessoa['Foto URL']) : '',
+      codigo: texto(a['Codigo']),
+      cliques: numero(a['Cliques']),
+      vendas: numero(a['Vendas']),
+      ganho: numero(a['Ganho MZN']),
+      activo: !!a['Is Active']
+    });
+  }
+
+  linhas.sort(function (a, b) { return b.vendas - a.vendas || b.cliques - a.cliques; });
+
+  ok(res, {
+    aceita: !!curso['Aceita Afiliados'],
+    comissao_pct: comissaoAfiliadoDe(curso),
+    min_pct: AFILIADO_MIN_PCT,
+    max_pct: AFILIADO_MAX_PCT,
+    afiliados: linhas,
+    cliques: linhas.reduce(function (s, l) { return s + l.cliques; }, 0),
+    vendas: linhas.reduce(function (s, l) { return s + l.vendas; }, 0),
+    pago: linhas.reduce(function (s, l) { return s + l.ganho; }, 0)
+  });
 };
 
 /* ============================================================
@@ -2026,6 +2311,30 @@ rotas['POST /course-save'] = async function (req, res, corpo) {
   if (veio('nivel')) campos['Nivel'] = texto(corpo.nivel) || 'Iniciante';
   if (veio('certificado')) campos['Tem Certificado'] = corpo.certificado === true;
 
+  /* Afiliados. O minimo e obrigatorio: quem liga tem de dar
+     pelo menos AFILIADO_MIN_PCT, senao nao vale a pena a ninguem. */
+  if (veio('aceita_afiliados')) {
+    const liga = corpo.aceita_afiliados === true;
+    campos['Aceita Afiliados'] = liga;
+    if (!liga) campos['Comissao Afiliado Pct'] = 0;
+  }
+  if (veio('comissao_afiliado')) {
+    const pct = Math.round(numero(corpo.comissao_afiliado));
+    const liga = veio('aceita_afiliados')
+      ? corpo.aceita_afiliados === true
+      : !!anterior['Aceita Afiliados'];
+
+    if (liga) {
+      if (pct < AFILIADO_MIN_PCT) {
+        return erro(res, 'a comissao do afiliado nao pode ser menor que ' + AFILIADO_MIN_PCT + '%');
+      }
+      if (pct > AFILIADO_MAX_PCT) {
+        return erro(res, 'a comissao do afiliado nao pode passar dos ' + AFILIADO_MAX_PCT + '%');
+      }
+      campos['Comissao Afiliado Pct'] = pct;
+    }
+  }
+
   if (Array.isArray(corpo.aprende)) {
     campos['O Que Vai Aprender'] = corpo.aprende.map(texto).filter(Boolean).slice(0, 12);
   }
@@ -2054,6 +2363,8 @@ rotas['POST /course-save'] = async function (req, res, corpo) {
   campos['Media Estrelas'] = 0;
   campos['Total Avaliacoes'] = 0;
   campos['Is Deleted'] = false;
+  if (!veio('aceita_afiliados')) campos['Aceita Afiliados'] = false;
+  if (!veio('comissao_afiliado')) campos['Comissao Afiliado Pct'] = 0;
 
   const novo = await bubbleCriar(T.curso, campos);
   ok(res, { curso: novo, novo: true, slug: campos['Slug'] });
