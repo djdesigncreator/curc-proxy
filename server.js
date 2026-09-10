@@ -1,3394 +1,1959 @@
-/* ============================================================
-   CURC — container proxy
-   versao: curc-8
-   Plataforma EAD marketplace para o mercado mocambicano.
+<!-- ============================================================
+     CURC — Estudio do formador
+     versao v3  ·  container curc-8
 
-   Novidades desta versao:
-     - area de membro de cada curso, com tres partes:
-         avisos do formador, duvidas dos alunos, e materiais
-     - marca propria do curso: cor, logotipo e mensagem de
-       boas-vindas, definidos pelo formador
-     - POST /space            tudo o que a area de membro precisa
-     - POST /announce         criar ou editar um aviso (dono)
-     - POST /announce-delete
-     - POST /ask              o aluno pergunta
-     - POST /answer           formador ou aluno responde
-     - POST /question-delete
-     - POST /material-upload  PDF ou ficheiro de apoio
-     - POST /material-delete
-     - os materiais contam para o espaco do plano; o video nao
+     v3: separador da marca do curso (cor, logotipo e boas-vindas),
+     separador de afiliados com a comissao que o dono decide,
+     e o painel dos meus links de afiliado na lista.
 
-   Da versao curc-7:
-     - programa de afiliados. O dono do curso decide quanto da,
-       entre AFILIADO_MIN_PCT e AFILIADO_MAX_PCT. A parte do
-       afiliado sai do bolo do formador, nunca do da plataforma.
-     - POST /affiliate-link    gera ou devolve o link do afiliado
-     - POST /affiliate-hit     conta um clique (publica)
-     - POST /my-affiliates     os meus links e o que renderam
-     - POST /course-affiliates quem promove este curso (dono)
-     - /pay aceita ref e reparte a venda por tres
+     v2: planos do formador. Mostra o plano actual, os cursos
+     gastos, o espaco ocupado, e trava a criacao quando o
+     limite chega ao fim. Ecra de planos com adesao por
+     M-Pesa e e-Mola. Refeito para telemovel.
 
-   Da versao curc-6:
-     - /signup-code atribui o plano gratuito, o nome e o papel
-       logo no registo, para ninguem chegar ao estudio sem plano
+     Colar numa pagina Bubble chamada "estudio" dentro de um
+     elemento HTML a ocupar a pagina toda.
 
-   Da versao curc-5:
-     - planos do formador: limite de cursos e de espaco de materiais
-     - POST /author-plans  lista os planos e o consumo actual
-     - POST /pay-plan      cobra a adesao por M-Pesa ou e-Mola
-     - /course-save trava a criacao acima do limite de cursos
-     - /upload-image trava acima do limite de espaco, apaga o
-       ficheiro antigo e desconta os bytes que ele ocupava
-     - o video nao entra em nenhuma contagem, por decisao de produto
+     Editar apenas as linhas do CFG, mais abaixo.
+     ============================================================ -->
 
-   Da versao curc-4:
-     - POST /progress, /lesson, /review, /my-reviews
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Sora:wght@400;600;700;800&family=Inter:wght@400;500;600&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/tus-js-client@4.1.0/dist/tus.min.js"></script>
 
-   Da versao curc-3:
-     - variaveis de ambiente limpas ao arrancar
-     - buscar() mostra a causa real em vez de "fetch failed"
-     - POST /diag-storage
-
-   Nota sobre o CDN_HOST: o caminho publico da Bunny inclui o nome
-   da zona de storage. Para a zona curc, CDN_HOST = curc.b-cdn.net/curc
-
-   Sem dependencias externas. Corre com node >= 18.
-   ============================================================ */
-
-const http = require('http');
-const crypto = require('crypto');
-const dns = require('dns').promises;
-
-const VERSAO = 'curc-8';
-const PORTA = process.env.PORT || 3000;
-
-/* ============================================================
-   0. LIMPEZA DAS VARIAVEIS DE AMBIENTE
-   ============================================================ */
-
-/* Tira espacos, quebras de linha e aspas que ficam agarradas
-   quando se cola o valor no painel da Bunny. */
-
-function limparValor(valor) {
-  return String(valor === undefined || valor === null ? '' : valor)
-    .trim()
-    .replace(/^["']+|["']+$/g, '')
-    .trim();
+<style>
+:root{
+  --noite:#070B24;
+  --painel:#0F1436;
+  --painel2:#151B44;
+  --linha:#232B5C;
+  --tinta:#F2F4FF;
+  --suave:#8B96C4;
+  --azul:#3B5BFF;
+  --magenta:#C13BE8;
+  --roxo:#A855F7;
+  --verde:#22C08A;
+  --ambar:#F0A02E;
+  --vermelho:#E5484D;
+  --grad:linear-gradient(115deg,#3B5BFF 0%,#8B3BF0 55%,#C13BE8 100%);
+  --seguro-baixo:env(safe-area-inset-bottom,0px);
 }
 
-/* Para nomes de maquina: tira o esquema e a barra do fim.
-   storage.bunnycdn.com  ·  nao  https://storage.bunnycdn.com/ */
+*{box-sizing:border-box}
+html,body{margin:0;padding:0;overflow-x:hidden}
 
-function limparHost(valor) {
-  return limparValor(valor)
-    .replace(/^https?:\/\//i, '')
-    .replace(/\/+$/, '');
+#curc{
+  font-family:Inter,system-ui,-apple-system,sans-serif;
+  background:var(--noite);
+  color:var(--tinta);
+  min-height:100vh;
+  font-size:15px;line-height:1.55;
+  -webkit-font-smoothing:antialiased;
+  -webkit-tap-highlight-color:transparent;
+}
+#curc h1,#curc h2,#curc h3{font-family:Sora,Inter,sans-serif;letter-spacing:-.02em}
+
+/* ---------- topo ---------- */
+
+.topo{
+  display:flex;align-items:center;gap:14px;
+  padding:12px 20px;border-bottom:1px solid var(--linha);
+  background:rgba(15,20,54,.82);
+  position:sticky;top:0;z-index:40;backdrop-filter:blur(12px);
+}
+.marca{display:flex;align-items:center;gap:9px;font-family:Sora;font-weight:800;font-size:19px;flex:none;cursor:pointer}
+.marca span{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+.topo .direita{margin-left:auto;display:flex;align-items:center;gap:10px;flex:none}
+.topo .quem{color:var(--suave);font-size:13.5px;white-space:nowrap}
+
+/* ---------- estrutura ---------- */
+
+.folha{max-width:1180px;margin:0 auto;padding:24px 20px 80px}
+.linha-topo{display:flex;align-items:flex-end;gap:16px;flex-wrap:wrap;margin-bottom:20px}
+.linha-topo h1{margin:0;font-size:27px;font-weight:700;line-height:1.2}
+.linha-topo p{margin:5px 0 0;color:var(--suave);font-size:14px}
+.linha-topo .direita{margin-left:auto}
+
+/* ---------- botoes ---------- */
+
+.btn{
+  font-family:Sora;font-weight:600;font-size:14px;
+  border:1px solid var(--linha);background:var(--painel2);color:var(--tinta);
+  padding:11px 17px;border-radius:10px;cursor:pointer;min-height:44px;
+  transition:border-color .15s,background .15s;
+}
+.btn:hover{border-color:#3A4585;background:#1B2255}
+.btn:focus-visible{outline:2px solid var(--roxo);outline-offset:2px}
+.btn:disabled{opacity:.45;cursor:not-allowed}
+.btn-p{background:var(--grad);border:none;color:#fff}
+.btn-p:hover{filter:brightness(1.12)}
+.btn-mini{padding:8px 13px;font-size:13px;border-radius:8px;min-height:38px}
+.btn-largo{width:100%;padding:13px 20px;font-size:15px;min-height:50px}
+.btn-perigo{color:#FF9EA1;border-color:#4A2030}
+.btn-perigo:hover{background:#3A1620;border-color:#7A2A38}
+
+/* ---------- faixa do plano ---------- */
+
+.faixa{
+  background:var(--painel);border:1px solid var(--linha);
+  border-radius:14px;padding:16px 18px;margin-bottom:18px;
+  display:flex;align-items:center;gap:18px;flex-wrap:wrap;
+}
+.faixa .selo-plano{
+  font-family:Sora;font-weight:700;font-size:13px;
+  padding:5px 13px;border-radius:20px;flex:none;
+  background:var(--grad);color:#fff;letter-spacing:.5px;
+}
+.faixa .medida{flex:1;min-width:150px}
+.faixa .medida b{font-family:Sora;font-size:13.5px;display:block;margin-bottom:5px}
+.faixa .medida small{color:var(--suave);font-size:12.5px}
+.faixa .btn{flex:none}
+
+.tubo{height:7px;background:#1C2352;border-radius:5px;overflow:hidden;margin-top:6px}
+.tubo i{display:block;height:100%;background:var(--grad);transition:width .3s}
+.tubo.cheio i{background:var(--ambar)}
+.tubo.estourado i{background:var(--vermelho)}
+
+/* ---------- numeros ---------- */
+
+.numeros{display:grid;grid-template-columns:repeat(4,1fr);gap:12px;margin-bottom:22px}
+.num{background:var(--painel);border:1px solid var(--linha);border-radius:13px;padding:15px 17px}
+.num b{display:block;font-family:Sora;font-size:25px;font-weight:700;line-height:1.15}
+.num small{color:var(--suave);font-size:12.5px}
+.num.ganho b{background:var(--grad);-webkit-background-clip:text;background-clip:text;color:transparent}
+
+/* ---------- cursos ---------- */
+
+.cursos{display:grid;grid-template-columns:repeat(auto-fill,minmax(255px,1fr));gap:16px}
+.curso{
+  background:var(--painel);border:1px solid var(--linha);
+  border-radius:14px;overflow:hidden;cursor:pointer;
+  display:flex;flex-direction:column;transition:border-color .15s,transform .15s;
+}
+.curso:hover{border-color:#3A4585;transform:translateY(-2px)}
+.curso .capa{aspect-ratio:16/9;background:#0B1030 center/cover no-repeat;display:grid;place-items:center;flex:none}
+.curso .capa em{color:#4A5490;font-style:normal;font-size:13px}
+.curso .corpo{padding:13px 15px 15px;min-width:0}
+.curso h3{
+  margin:0 0 5px;font-size:15.5px;font-weight:600;line-height:1.35;
+  display:-webkit-box;-webkit-line-clamp:2;-webkit-box-orient:vertical;overflow:hidden;
+}
+.curso .meta{color:var(--suave);font-size:12.5px;display:flex;gap:9px;flex-wrap:wrap}
+
+.selo{
+  display:inline-block;font-size:11.5px;font-weight:600;
+  padding:3px 9px;border-radius:20px;margin-bottom:8px;font-family:Sora;
+}
+.selo.rascunho{background:#3A2E10;color:#F7C46A}
+.selo.publicado{background:#0E3A2C;color:#4CD9A4}
+.selo.suspenso{background:#3A1620;color:#FF9EA1}
+
+/* ---------- vazio ---------- */
+
+.vazio{border:1px dashed var(--linha);border-radius:16px;padding:48px 22px;text-align:center}
+.vazio h2{margin:0 0 7px;font-size:19px;font-weight:600}
+.vazio p{margin:0 0 20px;color:var(--suave);max-width:44ch;margin-inline:auto}
+
+/* ---------- planos ---------- */
+
+.planos{display:grid;grid-template-columns:repeat(auto-fit,minmax(240px,1fr));gap:16px}
+.plano{
+  background:var(--painel);border:1px solid var(--linha);
+  border-radius:16px;padding:22px 20px;display:flex;flex-direction:column;
+}
+.plano.actual{border-color:var(--roxo);box-shadow:0 0 0 1px var(--roxo)}
+.plano .cabeca{font-family:Sora;font-weight:700;font-size:17px;margin-bottom:3px}
+.plano .frase{color:var(--suave);font-size:13px;margin-bottom:16px;min-height:38px}
+.plano .preco{font-family:Sora;font-weight:700;font-size:28px;line-height:1.1}
+.plano .preco small{display:block;color:var(--suave);font-size:12.5px;font-weight:400;margin-top:3px}
+.plano ul{list-style:none;margin:18px 0;padding:0;flex:1}
+.plano li{display:flex;gap:9px;align-items:flex-start;padding:5px 0;font-size:13.5px;color:#C4CCEC}
+.plano li .v{color:var(--verde);flex:none;margin-top:2px}
+.plano .agora{
+  text-align:center;font-family:Sora;font-weight:600;font-size:13.5px;
+  color:var(--roxo);padding:13px 0;
 }
 
-/* Para enderecos completos: mantem o esquema, tira a barra do fim. */
+/* ---------- editor ---------- */
 
-function limparUrl(valor) {
-  return limparValor(valor).replace(/\/+$/, '');
+.voltar{
+  background:none;border:none;color:var(--suave);cursor:pointer;
+  font-size:14px;padding:8px 0;margin-bottom:10px;font-family:Inter;
+  min-height:40px;display:flex;align-items:center;
 }
+.voltar:hover{color:var(--tinta)}
 
-/* ---------- variaveis de ambiente ---------- */
+.split{display:grid;grid-template-columns:minmax(0,1fr) 312px;gap:24px;align-items:start}
 
-const BUBBLE_BASE = limparUrl(process.env.BUBBLE_BASE);
-const BUBBLE_TOKEN = limparValor(process.env.BUBBLE_TOKEN);
-
-const MOZ_WALLET = limparValor(process.env.MOZ_WALLET);
-const MOPAY_BASE = limparUrl(process.env.MOPAY_BASE) || 'https://mozpayment.co.mz/api/1.1/wf';
-
-const COMISSAO_PCT = Number(limparValor(process.env.COMISSAO_PCT) || 15);
-
-/* Quanto o formador pode dar ao afiliado. O minimo e obrigatorio:
-   quem liga os afiliados no seu curso tem de dar pelo menos isto. */
-const AFILIADO_MIN_PCT = Number(limparValor(process.env.AFILIADO_MIN_PCT) || 10);
-const AFILIADO_MAX_PCT = Number(limparValor(process.env.AFILIADO_MAX_PCT) || 50);
-
-const RESEND_KEY = limparValor(process.env.RESEND_KEY);
-const MAIL_FROM = limparValor(process.env.MAIL_FROM) || 'CURC <noreply@curc.co.mz>';
-
-const APP_URL = limparUrl(process.env.APP_URL);
-const UPLOAD_SECRET = limparValor(process.env.UPLOAD_SECRET);
-
-/* Bunny Storage — capas dos cursos, fotos e anexos */
-const STORAGE_ZONE = limparValor(process.env.STORAGE_ZONE);
-const STORAGE_PASSWORD = limparValor(process.env.STORAGE_PASSWORD);
-const STORAGE_HOST = limparHost(process.env.STORAGE_HOST) || 'storage.bunnycdn.com';
-const CDN_HOST = limparHost(process.env.CDN_HOST);
-
-/* Bunny Stream — videos das aulas e de introducao */
-const STREAM_LIBRARY = limparValor(process.env.STREAM_LIBRARY);
-const STREAM_KEY = limparValor(process.env.STREAM_KEY);
-const STREAM_CDN = limparHost(process.env.STREAM_CDN);
-
-/* ---------- nomes dos data types no Bubble ---------- */
-/* O Bubble aceita o nome do tipo em minusculas, sem espacos. */
-
-const T = {
-  user: 'user',
-  categoria: 'category',
-  curso: 'course',
-  modulo: 'module',
-  aula: 'lesson',
-  inscricao: 'enrollment',
-  progresso: 'progress',
-  live: 'live',
-  pagamento: 'payment',
-  cartaoPendente: 'card_payment_pending',
-  planoFormador: 'plano_formador',
-  afiliado: 'afiliado',
-  anuncio: 'anuncio',
-  resposta: 'resposta',
-  material: 'material',
-  levantamento: 'payout',
-  avaliacao: 'review',
-  duvida: 'question',
-  cupao: 'coupon',
-  certificado: 'certificate'
-};
-
-/* ============================================================
-   1. UTILITARIOS
-   ============================================================ */
-
-function agora() {
-  return new Date().toISOString();
+.abas{display:flex;gap:4px;border-bottom:1px solid var(--linha);margin-bottom:20px;overflow-x:auto;scrollbar-width:none}
+.abas::-webkit-scrollbar{display:none}
+.aba{
+  background:none;border:none;border-bottom:2px solid transparent;
+  color:var(--suave);font-family:Sora;font-weight:600;font-size:14px;
+  padding:11px 15px;cursor:pointer;margin-bottom:-1px;white-space:nowrap;min-height:44px;
 }
+.aba.on{color:var(--tinta);border-bottom-color:var(--roxo)}
 
-function log(...args) {
-  console.log('[' + agora() + ']', ...args);
+.bloco{background:var(--painel);border:1px solid var(--linha);border-radius:14px;padding:19px;margin-bottom:15px}
+.bloco h2{margin:0 0 3px;font-size:16px;font-weight:600}
+.bloco .ajuda{margin:0 0 16px;color:var(--suave);font-size:13px;line-height:1.6}
+
+.campo{margin-bottom:15px}
+.campo label{display:block;font-size:13px;font-weight:500;margin-bottom:6px;color:#C4CCEC}
+.campo .nota{color:var(--suave);font-size:12px;margin-top:6px;line-height:1.5}
+
+input[type=text],input[type=number],input[type=tel],select,textarea{
+  width:100%;background:#0A0F30;border:1px solid var(--linha);
+  color:var(--tinta);border-radius:10px;padding:11px 12px;
+  font-family:Inter;font-size:16px;min-height:46px;
 }
-
-function responder(res, codigo, corpo) {
-  const texto = JSON.stringify(corpo);
-  res.writeHead(codigo, {
-    'Content-Type': 'application/json; charset=utf-8',
-    'Content-Length': Buffer.byteLength(texto),
-    'Access-Control-Allow-Origin': '*',
-    'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-    'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-    'Cache-Control': 'no-store'
-  });
-  res.end(texto);
+textarea{resize:vertical;min-height:96px;line-height:1.6}
+input:focus,select:focus,textarea:focus{outline:none;border-color:var(--roxo)}
+select{
+  -webkit-appearance:none;appearance:none;padding-right:32px;
+  background-image:url("data:image/svg+xml;charset=utf-8,%3Csvg xmlns='http://www.w3.org/2000/svg' width='10' height='6' fill='none' stroke='%238B96C4' stroke-width='1.6'%3E%3Cpath d='M1 1l4 4 4-4'/%3E%3C/svg%3E");
+  background-repeat:no-repeat;background-position:right 12px center;
 }
+select option{background:#0A0F30}
 
-function ok(res, dados) {
-  responder(res, 200, Object.assign({ ok: true }, dados || {}));
+.duas{display:grid;grid-template-columns:1fr 1fr;gap:14px}
+
+.troca{display:flex;align-items:center;gap:11px;cursor:pointer;user-select:none;min-height:44px}
+.troca input{width:19px;height:19px;accent-color:var(--roxo);cursor:pointer;flex:none}
+.troca span{font-size:14px}
+
+/* ---------- capa e intro ---------- */
+
+.media{display:grid;grid-template-columns:1fr 1fr;gap:16px}
+.alvo{border:1px dashed var(--linha);border-radius:12px;padding:16px;text-align:center;background:#0A0F30}
+.alvo h3{margin:0 0 3px;font-size:14px;font-weight:600}
+.alvo p{margin:0 0 12px;color:var(--suave);font-size:12.5px}
+.alvo img{width:100%;aspect-ratio:16/9;object-fit:cover;border-radius:9px;margin-bottom:12px;display:block}
+
+.arco{width:78px;height:78px;margin:0 auto 10px;position:relative}
+.arco svg{transform:rotate(-90deg)}
+.arco circle{fill:none;stroke-width:7;stroke-linecap:round}
+.arco .fundo{stroke:#1C2352}
+.arco .frente{stroke:url(#gradArco);transition:stroke-dashoffset .3s}
+.arco b{position:absolute;inset:0;display:grid;place-items:center;font-family:Sora;font-size:15px;font-weight:700}
+
+/* ---------- curriculo ---------- */
+
+.modulo{background:var(--painel);border:1px solid var(--linha);border-radius:13px;margin-bottom:13px;overflow:hidden}
+.modulo-topo{display:flex;align-items:center;gap:10px;padding:13px 15px;background:var(--painel2);flex-wrap:wrap}
+.modulo-topo input{background:none;border:none;font-family:Sora;font-weight:600;font-size:15px;padding:0;flex:1;min-width:120px;min-height:auto}
+.modulo-topo input:focus{outline:none;border-bottom:1px solid var(--roxo)}
+.modulo-acoes{display:flex;gap:6px;flex:none}
+
+.aula{border-top:1px solid var(--linha);padding:13px 15px}
+.aula-topo{display:flex;align-items:center;gap:9px;flex-wrap:wrap}
+.aula-topo .ordem{color:#4A5490;font-family:Sora;font-size:13px;min-width:18px;flex:none}
+.aula-topo input[type=text]{flex:1;min-width:130px}
+.aula-baixo{display:flex;align-items:center;gap:14px;margin-top:10px;flex-wrap:wrap}
+.estado-video{font-size:12.5px;color:var(--suave);display:flex;align-items:center;gap:7px}
+.ponto{width:7px;height:7px;border-radius:50%;background:#4A5490;flex:none}
+.ponto.ok{background:var(--verde)}
+.ponto.espera{background:var(--ambar)}
+.barra{flex:1;min-width:120px;height:5px;background:#1C2352;border-radius:4px;overflow:hidden}
+.barra i{display:block;height:100%;width:0;background:var(--grad);transition:width .25s}
+
+.sem-aulas{padding:15px;color:var(--suave);font-size:13px;border-top:1px solid var(--linha)}
+
+/* ---------- painel de publicacao ---------- */
+
+.lado{position:sticky;top:76px}
+.lista-check{list-style:none;margin:0 0 16px;padding:0}
+.lista-check li{display:flex;align-items:flex-start;gap:10px;padding:6px 0;font-size:13.5px}
+.lista-check .marca-c{
+  width:18px;height:18px;border-radius:50%;flex:none;margin-top:2px;
+  border:1.5px solid #3A4585;display:grid;place-items:center;font-size:10px;color:var(--noite);
 }
+.lista-check li.feito .marca-c{background:var(--verde);border-color:var(--verde)}
+.lista-check li.feito{color:var(--suave)}
 
-function erro(res, mensagem, codigo) {
-  responder(res, codigo || 400, { ok: false, erro: mensagem });
+/* ---------- folha de pagamento ---------- */
+
+.cortina{
+  position:fixed;inset:0;background:rgba(7,11,36,.82);
+  backdrop-filter:blur(6px);z-index:80;
+  display:flex;align-items:center;justify-content:center;padding:20px;
 }
-
-function lerCorpo(req, limiteMB) {
-  const limite = (limiteMB || 2) * 1024 * 1024;
-  return new Promise((resolve, reject) => {
-    let bruto = '';
-    let tamanho = 0;
-    req.on('data', function (pedaco) {
-      tamanho += pedaco.length;
-      if (tamanho > limite) {
-        reject(new Error('corpo demasiado grande'));
-        req.destroy();
-        return;
-      }
-      bruto += pedaco;
-    });
-    req.on('end', function () {
-      if (!bruto) { resolve({}); return; }
-      try { resolve(JSON.parse(bruto)); }
-      catch (e) { reject(new Error('JSON invalido')); }
-    });
-    req.on('error', reject);
-  });
+.caixa{
+  background:var(--painel);border:1px solid var(--linha);
+  border-radius:18px;padding:25px;width:100%;max-width:430px;
+  max-height:88vh;overflow:auto;
 }
+.caixa h2{margin:0 0 4px;font-size:20px;font-weight:700}
+.caixa .ajuda{margin:0 0 19px;color:var(--suave);font-size:13.5px}
+.puxador{display:none;width:38px;height:4px;border-radius:3px;background:#3A4585;margin:0 auto 16px}
 
-function texto(valor) {
-  if (valor === null || valor === undefined) return '';
-  return String(valor).trim();
+.metodos{display:grid;grid-template-columns:1fr 1fr;gap:11px;margin-bottom:17px}
+.metodo{
+  border:1px solid var(--linha);background:#0A0F30;border-radius:12px;
+  padding:15px 12px;text-align:center;cursor:pointer;
+  transition:border-color .15s;min-height:66px;
 }
+.metodo:hover{border-color:#3A4585}
+.metodo.on{border-color:var(--roxo);background:#161C48}
+.metodo b{display:block;font-family:Sora;font-size:14.5px}
+.metodo small{color:var(--suave);font-size:12px}
 
-function numero(valor) {
-  const n = Number(valor);
-  return Number.isFinite(n) ? n : 0;
+.total{display:flex;justify-content:space-between;align-items:baseline;padding:14px 0;border-top:1px solid var(--linha);margin-top:6px;gap:12px}
+.total b{font-family:Sora;font-size:22px;font-weight:700}
+
+.espera{text-align:center;padding:22px 0}
+.roda{
+  width:44px;height:44px;margin:0 auto 16px;border-radius:50%;
+  border:3px solid #1C2352;border-top-color:var(--roxo);
+  animation:gira .9s linear infinite;
 }
+@keyframes gira{to{transform:rotate(360deg)}}
 
-function slugificar(valor) {
-  return texto(valor)
-    .toLowerCase()
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-z0-9]+/g, '-')
-    .replace(/^-+|-+$/g, '')
-    .slice(0, 80);
+/* ---------- avisos ---------- */
+
+.avisos{
+  position:fixed;right:14px;left:14px;bottom:14px;z-index:95;
+  display:flex;flex-direction:column;gap:9px;align-items:flex-end;pointer-events:none;
 }
-
-function codigoAleatorio(tamanho) {
-  const alfabeto = 'ABCDEFGHJKLMNPQRSTUVWXYZ23456789';
-  let saida = '';
-  const bytes = crypto.randomBytes(tamanho);
-  for (let i = 0; i < tamanho; i++) saida += alfabeto[bytes[i] % alfabeto.length];
-  return saida;
+.aviso{
+  background:var(--painel2);border:1px solid var(--linha);
+  border-left:3px solid var(--roxo);
+  padding:12px 16px;border-radius:10px;font-size:13.5px;
+  max-width:340px;box-shadow:0 8px 28px rgba(0,0,0,.5);
 }
+.aviso.bom{border-left-color:var(--verde)}
+.aviso.mau{border-left-color:var(--vermelho)}
 
-function referencia(prefixo) {
-  return prefixo + '-' + Date.now() + '-' + codigoAleatorio(5);
-}
-
-/* ---------- causa real de um erro de rede ---------- */
-
-/* O fetch do Node atira sempre "fetch failed" e esconde o motivo
-   dentro de error.cause. Isto desenterra-o. */
-
-function causaDe(e) {
-  if (!e) return 'desconhecida';
-  const causa = e.cause;
-  if (!causa) return e.message || String(e);
-  const codigo = causa.code ? String(causa.code) : '';
-  const msg = causa.message ? String(causa.message) : '';
-  if (codigo && msg) return codigo + ' — ' + msg;
-  return codigo || msg || String(causa);
-}
-
-/* Envolve o fetch para que qualquer falha de rede diga
-   quem falhou, porque falhou e para onde ia. */
-
-async function buscar(url, opcoes, quem) {
-  try {
-    return await fetch(url, opcoes);
-  } catch (e) {
-    const limpo = String(url).split('?')[0];
-    throw new Error(
-      (quem || 'ligacao') + ' falhou: ' + causaDe(e) + ' · destino: ' + limpo
-    );
-  }
-}
-
-/* ============================================================
-   2. DATA API DO BUBBLE
-   ============================================================ */
-
-function cabecalhosBubble() {
-  return {
-    'Authorization': 'Bearer ' + BUBBLE_TOKEN,
-    'Content-Type': 'application/json'
-  };
-}
-
-async function bubbleListar(tipo, restricoes, opcoes) {
-  const cfg = opcoes || {};
-  const params = new URLSearchParams();
-  if (restricoes && restricoes.length) {
-    params.set('constraints', JSON.stringify(restricoes));
-  }
-  params.set('limit', String(cfg.limite || 100));
-  params.set('cursor', String(cfg.cursor || 0));
-  if (cfg.ordenarPor) {
-    params.set('sort_field', cfg.ordenarPor);
-    params.set('descending', cfg.descendente ? 'true' : 'false');
-  }
-
-  const url = BUBBLE_BASE + '/' + tipo + '?' + params.toString();
-  const resposta = await buscar(url, { headers: cabecalhosBubble() }, 'Bubble listar ' + tipo);
-
-  if (!resposta.ok) {
-    const detalhe = await resposta.text();
-    throw new Error('Bubble listar ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
-  }
-
-  const dados = await resposta.json();
-  const corpo = (dados && dados.response) || {};
-  return {
-    itens: corpo.results || [],
-    restantes: numero(corpo.remaining),
-    cursor: numero(corpo.cursor) + numero(corpo.count)
-  };
-}
-
-async function bubbleTodos(tipo, restricoes, opcoes) {
-  const cfg = opcoes || {};
-  const maximo = cfg.maximo || 1000;
-  let cursor = 0;
-  let juntos = [];
-  while (juntos.length < maximo) {
-    const pagina = await bubbleListar(tipo, restricoes, {
-      limite: 100,
-      cursor: cursor,
-      ordenarPor: cfg.ordenarPor,
-      descendente: cfg.descendente
-    });
-    juntos = juntos.concat(pagina.itens);
-    if (!pagina.restantes || !pagina.itens.length) break;
-    cursor = pagina.cursor;
-  }
-  return juntos.slice(0, maximo);
-}
-
-async function bubblePorId(tipo, id) {
-  if (!texto(id)) return null;
-  const resposta = await buscar(
-    BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id),
-    { headers: cabecalhosBubble() },
-    'Bubble ler ' + tipo
-  );
-  if (resposta.status === 404) return null;
-  if (!resposta.ok) {
-    const detalhe = await resposta.text();
-    throw new Error('Bubble ler ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
-  }
-  const dados = await resposta.json();
-  return (dados && dados.response) || null;
-}
-
-async function bubbleCriar(tipo, objecto) {
-  const resposta = await buscar(BUBBLE_BASE + '/' + tipo, {
-    method: 'POST',
-    headers: cabecalhosBubble(),
-    body: JSON.stringify(objecto)
-  }, 'Bubble criar ' + tipo);
-  if (!resposta.ok) {
-    const detalhe = await resposta.text();
-    throw new Error('Bubble criar ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
-  }
-  const dados = await resposta.json();
-  return (dados && dados.id) || null;
-}
-
-async function bubbleActualizar(tipo, id, objecto) {
-  const resposta = await buscar(BUBBLE_BASE + '/' + tipo + '/' + encodeURIComponent(id), {
-    method: 'PATCH',
-    headers: cabecalhosBubble(),
-    body: JSON.stringify(objecto)
-  }, 'Bubble actualizar ' + tipo);
-  if (!resposta.ok) {
-    const detalhe = await resposta.text();
-    throw new Error('Bubble actualizar ' + tipo + ' falhou (' + resposta.status + '): ' + detalhe.slice(0, 300));
-  }
-  return true;
-}
-
-function restricao(campo, condicao, valor) {
-  return { key: campo, constraint_type: condicao, value: valor };
-}
+.escondido{display:none !important}
 
 /* ============================================================
-   3. EMAIL (RESEND)
+   TELEMOVEL
    ============================================================ */
 
-async function enviarEmail(para, assunto, html) {
-  if (!RESEND_KEY) {
-    log('Resend sem chave — email nao enviado para', para);
-    return false;
-  }
-  try {
-    const resposta = await buscar('https://api.resend.com/emails', {
-      method: 'POST',
-      headers: {
-        'Authorization': 'Bearer ' + RESEND_KEY,
-        'Content-Type': 'application/json'
-      },
-      body: JSON.stringify({ from: MAIL_FROM, to: [para], subject: assunto, html: html })
-    }, 'Resend');
-    if (!resposta.ok) {
-      log('Resend recusou:', await resposta.text());
-      return false;
-    }
-    return true;
-  } catch (e) {
-    log('Resend rebentou:', e.message);
-    return false;
-  }
+@media (max-width:900px){
+  .split{grid-template-columns:1fr}
+  .lado{position:static}
+  .numeros{grid-template-columns:1fr 1fr}
+  .media,.duas{grid-template-columns:1fr}
 }
 
-function moldeCodigo(nome, codigo) {
-  return `
-<div style="font-family:Arial,Helvetica,sans-serif;background:#0A0E27;padding:32px">
-  <div style="max-width:520px;margin:0 auto;background:#111633;border-radius:16px;padding:32px;color:#fff">
-    <div style="font-size:26px;font-weight:800;letter-spacing:2px;color:#A855F7">CURC</div>
-    <div style="font-size:12px;letter-spacing:3px;color:#7C8DB5;margin-top:4px">APRENDA SEM LIMITES</div>
-    <h1 style="font-size:20px;margin:28px 0 8px">Ola ${nome || 'de novo'},</h1>
-    <p style="color:#B9C3DE;line-height:1.6;margin:0 0 24px">
-      Este e o seu codigo de confirmacao. Escreva-o na pagina para activar a conta.
-    </p>
-    <div style="background:#0A0E27;border:1px solid #2A3560;border-radius:12px;padding:20px;text-align:center">
-      <div style="font-family:monospace;font-size:30px;letter-spacing:8px;color:#C084FC;font-weight:700">${codigo}</div>
+@media (max-width:640px){
+  .topo{padding:11px 14px;gap:10px}
+  .topo .quem{display:none}
+
+  .folha{padding:18px 14px 80px}
+  .linha-topo{gap:12px}
+  .linha-topo h1{font-size:22px}
+  .linha-topo .direita{margin-left:0;flex-basis:100%}
+  .linha-topo .direita .btn{width:100%}
+
+  .faixa{padding:14px;gap:13px}
+  .faixa .selo-plano{order:-1}
+  .faixa .btn{width:100%}
+
+  .numeros{gap:9px}
+  .num{padding:13px 14px}
+  .num b{font-size:21px}
+
+  .cursos{grid-template-columns:1fr;gap:11px}
+  .curso{flex-direction:row}
+  .curso .capa{width:132px;aspect-ratio:4/3;flex:none}
+  .curso .corpo{padding:11px 13px}
+  .curso h3{font-size:14.5px}
+
+  .bloco{padding:16px}
+  .modulo-acoes{width:100%}
+  .modulo-acoes .btn{flex:1}
+
+  .cortina{align-items:flex-end;padding:0}
+  .caixa{
+    max-width:none;border-radius:20px 20px 0 0;
+    border-left:none;border-right:none;border-bottom:none;
+    padding:16px 18px calc(20px + var(--seguro-baixo));
+  }
+  .puxador{display:block}
+
+  .avisos{align-items:stretch}
+  .aviso{max-width:none}
+}
+
+@media (max-width:360px){
+  .curso .capa{width:108px}
+  .numeros{grid-template-columns:1fr}
+  .metodos{grid-template-columns:1fr}
+}
+
+@media (prefers-reduced-motion:reduce){
+  *{transition:none !important}
+  .roda{animation-duration:2.4s}
+}
+</style>
+
+<div id="curc">
+
+  <div class="topo">
+    <div class="marca" id="b-marca">
+      <svg width="26" height="26" viewBox="0 0 32 32" aria-hidden="true">
+        <defs>
+          <linearGradient id="gradMarca" x1="0" y1="0" x2="1" y2="1">
+            <stop offset="0%" stop-color="#3B5BFF"/><stop offset="100%" stop-color="#C13BE8"/>
+          </linearGradient>
+        </defs>
+        <path d="M27 8.5A12 12 0 1 0 27 23.5" stroke="url(#gradMarca)" stroke-width="5"
+              fill="none" stroke-linecap="round"/>
+        <path d="M14 11.5l8 4.5-8 4.5z" fill="url(#gradMarca)"/>
+      </svg>
+      <span>CURC</span>
     </div>
-    <p style="color:#7C8DB5;font-size:13px;margin-top:24px">
-      O codigo expira dentro de 30 minutos. Se nao foi voce que pediu, ignore este email.
-    </p>
+    <div class="direita">
+      <div class="quem" id="quem"></div>
+    </div>
   </div>
-</div>`;
-}
+
+  <!-- ================= LISTA ================= -->
+  <div class="folha" id="vista-lista">
+    <div class="linha-topo">
+      <div>
+        <h1>Os meus cursos</h1>
+        <p id="sub-lista">A carregar…</p>
+      </div>
+      <div class="direita">
+        <button class="btn btn-p" id="b-novo">Criar curso</button>
+      </div>
+    </div>
+
+    <div id="faixa-plano"></div>
+    <div class="numeros" id="numeros"></div>
+    <div id="area-cursos"></div>
+  </div>
+
+  <!-- ================= PLANOS ================= -->
+  <div class="folha escondido" id="vista-planos">
+    <button class="voltar" id="b-voltar-planos">← Os meus cursos</button>
+    <div class="linha-topo">
+      <div>
+        <h1>Planos</h1>
+        <p>Sem mensalidade. Paga uma vez para aderir. A plataforma fica com <span id="pct-2">15</span>% de cada venda.</p>
+      </div>
+    </div>
+    <div id="area-planos"></div>
+  </div>
+
+  <!-- ================= EDITOR ================= -->
+  <div class="folha escondido" id="vista-editor">
+    <button class="voltar" id="b-voltar">← Os meus cursos</button>
+
+    <div class="linha-topo">
+      <div>
+        <h1 id="titulo-editor">Curso</h1>
+        <p id="sub-editor"></p>
+      </div>
+    </div>
+
+    <div class="abas">
+      <button class="aba on" data-aba="detalhes">Detalhes</button>
+      <button class="aba" data-aba="conteudo">Conteúdo</button>
+      <button class="aba" data-aba="marca">Marca</button>
+      <button class="aba" data-aba="afiliados">Afiliados</button>
+    </div>
+
+    <div class="split">
+      <div>
+        <div id="painel-detalhes">
+          <div class="bloco">
+            <h2>O essencial</h2>
+            <p class="ajuda">É isto que o aluno vê antes de decidir.</p>
+
+            <div class="campo">
+              <label for="f-titulo">Título</label>
+              <input type="text" id="f-titulo" maxlength="120" placeholder="Node.js do zero ao primeiro emprego">
+            </div>
+
+            <div class="campo">
+              <label for="f-subtitulo">Uma linha que resume</label>
+              <input type="text" id="f-subtitulo" maxlength="160" placeholder="Construa APIs reais em oito semanas">
+            </div>
+
+            <div class="campo">
+              <label for="f-descricao">Descrição</label>
+              <textarea id="f-descricao" placeholder="Para quem é o curso, o que se faz nele, e onde a pessoa chega no fim."></textarea>
+            </div>
+
+            <div class="duas">
+              <div class="campo">
+                <label for="f-categoria">Categoria</label>
+                <select id="f-categoria"></select>
+              </div>
+              <div class="campo">
+                <label for="f-nivel">Nível</label>
+                <select id="f-nivel">
+                  <option>Iniciante</option>
+                  <option>Intermedio</option>
+                  <option>Avancado</option>
+                </select>
+              </div>
+            </div>
+          </div>
+
+          <div class="bloco">
+            <h2>Preço</h2>
+            <p class="ajuda">A plataforma fica com <span id="pct-comissao">15</span>% de cada venda. O resto vai para o seu saldo.</p>
+
+            <div class="campo">
+              <label class="troca">
+                <input type="checkbox" id="f-gratis">
+                <span>Curso gratuito</span>
+              </label>
+            </div>
+
+            <div class="duas" id="caixa-precos">
+              <div class="campo">
+                <label for="f-preco">Preço em meticais</label>
+                <input type="number" id="f-preco" min="0" step="50" placeholder="1500">
+              </div>
+              <div class="campo">
+                <label for="f-promo">Preço promocional</label>
+                <input type="number" id="f-promo" min="0" step="50" placeholder="0">
+                <div class="nota">Deixe a zero se não houver promoção.</div>
+              </div>
+            </div>
+            <div class="campo" id="nota-ganho"></div>
+          </div>
+
+          <div class="bloco">
+            <h2>Capa e apresentação</h2>
+            <p class="ajuda">Todos os cursos precisam de um vídeo de introdução. É o que convence.</p>
+
+            <div class="media">
+              <div class="alvo">
+                <div id="pre-capa"></div>
+                <h3>Imagem de capa</h3>
+                <p id="txt-capa">JPG, PNG ou WebP até 5 MB</p>
+                <button class="btn btn-mini" id="b-capa">Escolher imagem</button>
+                <input type="file" id="in-capa" accept="image/jpeg,image/png,image/webp" class="escondido">
+              </div>
+
+              <div class="alvo">
+                <div id="pre-intro"></div>
+                <h3>Vídeo de introdução</h3>
+                <p id="txt-intro">MP4 ou MOV</p>
+                <button class="btn btn-mini" id="b-intro">Escolher vídeo</button>
+                <input type="file" id="in-intro" accept="video/*" class="escondido">
+              </div>
+            </div>
+          </div>
+
+          <div class="bloco">
+            <h2>Promessas e requisitos</h2>
+            <p class="ajuda">Uma por linha.</p>
+
+            <div class="campo">
+              <label for="f-aprende">O que o aluno vai saber fazer</label>
+              <textarea id="f-aprende" placeholder="Construir uma API do zero&#10;Ligar a uma base de dados&#10;Pôr o projecto no ar"></textarea>
+            </div>
+
+            <div class="campo">
+              <label for="f-requisitos">O que precisa de saber antes</label>
+              <textarea id="f-requisitos" placeholder="Lógica de programação básica&#10;Um computador com internet"></textarea>
+            </div>
+
+            <div class="campo">
+              <label class="troca">
+                <input type="checkbox" id="f-certificado">
+                <span>Emitir certificado no fim</span>
+              </label>
+            </div>
+          </div>
+
+          <button class="btn btn-p btn-largo" id="b-guardar">Guardar alterações</button>
+        </div>
+
+        <div id="painel-marca" class="escondido"></div>
+        <div id="painel-afiliados" class="escondido"></div>
+
+        <div id="painel-conteudo" class="escondido">
+          <div class="bloco">
+            <h2>Programa do curso</h2>
+            <p class="ajuda">Módulos agrupam aulas. Marque como livre a aula que qualquer pessoa pode ver sem comprar.</p>
+            <button class="btn" id="b-modulo">Novo módulo</button>
+          </div>
+          <div id="area-modulos"></div>
+        </div>
+      </div>
+
+      <aside class="lado">
+        <div class="bloco">
+          <h2>Para publicar</h2>
+          <p class="ajuda" id="resumo-check"></p>
+          <ul class="lista-check" id="check"></ul>
+          <button class="btn btn-p btn-largo" id="b-publicar">Publicar curso</button>
+          <button class="btn btn-largo escondido" id="b-despublicar" style="margin-top:9px">Voltar a rascunho</button>
+        </div>
+        <div class="bloco">
+          <h2>Apagar</h2>
+          <p class="ajuda">Só é possível enquanto não houver alunos inscritos.</p>
+          <button class="btn btn-perigo btn-largo" id="b-apagar">Apagar curso</button>
+        </div>
+      </aside>
+    </div>
+  </div>
+
+  <div class="cortina escondido" id="cortina">
+    <div class="caixa" id="caixa"></div>
+  </div>
+
+  <div class="avisos" id="avisos"></div>
+
+  <svg width="0" height="0" style="position:absolute" aria-hidden="true">
+    <defs>
+      <linearGradient id="gradArco" x1="0" y1="0" x2="1" y2="1">
+        <stop offset="0%" stop-color="#3B5BFF"/><stop offset="100%" stop-color="#C13BE8"/>
+      </linearGradient>
+    </defs>
+  </svg>
+</div>
+
+<script>
+(function(){
+'use strict';
 
 /* ============================================================
-   4. MOPAYMENT — M-PESA E E-MOLA
+   CONFIGURACAO — editar apenas estas linhas
    ============================================================ */
 
-/* A MoPayment devolve sempre HTTP 200. O resultado real esta no cod
-   dentro do JSON — e nem sempre no mesmo sitio. Esta funcao procura
-   em todos os campos onde ja o vimos aparecer. */
-
-function lerRespostaMoPayment(dados) {
-  if (!dados || typeof dados !== 'object') {
-    return { sucesso: false, codigo: 0, mensagem: 'resposta vazia da MoPayment' };
-  }
-
-  const aninhado = (dados.response && typeof dados.response === 'object') ? dados.response : {};
-
-  const candidatos = [
-    dados.cod, dados.code, dados.codigo, dados.status_code,
-    aninhado.cod, aninhado.code, aninhado.codigo, aninhado.status_code
-  ];
-
-  let codigo = 0;
-  for (const valor of candidatos) {
-    const n = Number(valor);
-    if (Number.isFinite(n) && n > 0) { codigo = n; break; }
-  }
-
-  const estado = texto(dados.status || aninhado.status).toLowerCase();
-  const sucesso = codigo === 200 || (codigo === 0 && estado === 'success');
-
-  const mensagem = texto(
-    dados.mensagem || dados.message || dados.detalhe ||
-    aninhado.mensagem || aninhado.message || aninhado.detalhe ||
-    (sucesso ? 'Pagamento processado' : 'Pagamento rejeitado')
-  );
-
-  const transacao = texto(
-    dados.transacao || dados.transaction || dados.transaction_id ||
-    aninhado.transacao || aninhado.transaction || ''
-  );
-
-  return { sucesso: sucesso, codigo: codigo || (sucesso ? 200 : 409), mensagem: mensagem, transacao: transacao };
-}
-
-function normalizarNumero(valor) {
-  const so = texto(valor).replace(/\D/g, '');
-  if (so.length === 12 && so.startsWith('258')) return so.slice(3);
-  if (so.length === 9) return so;
-  return so;
-}
-
-function operadoraDoNumero(numeroLimpo) {
-  const prefixo = numeroLimpo.slice(0, 2);
-  if (prefixo === '84' || prefixo === '85') return 'mpesa';
-  if (prefixo === '86' || prefixo === '87') return 'emola';
-  return '';
-}
-
-async function cobrarCarteira(metodo, numeroCliente, nomeCliente, valorMZN) {
-  const caminho = metodo === 'emola'
-    ? '/pagamentorotativoemola'
-    : '/pagamentorotativompesa';
-
-  const corpo = {
-    carteira: MOZ_WALLET,
-    numero: numeroCliente,
-    cliente: nomeCliente || 'Cliente CURC',
-    valor: String(Math.round(valorMZN))
-  };
-
-  let dados = null;
-  let bruto = '';
-
-  try {
-    const resposta = await buscar(MOPAY_BASE + caminho, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify(corpo)
-    }, 'MoPayment');
-    bruto = await resposta.text();
-    try { dados = JSON.parse(bruto); } catch (e) { dados = null; }
-  } catch (e) {
-    return {
-      sucesso: false, codigo: 0,
-      mensagem: 'Nao foi possivel falar com a MoPayment: ' + e.message,
-      transacao: '', bruto: ''
-    };
-  }
-
-  const resultado = lerRespostaMoPayment(dados);
-  resultado.bruto = bruto.slice(0, 2000);
-  return resultado;
-}
-
-/* ============================================================
-   4B. BUNNY — STREAM E STORAGE
-   ============================================================ */
-
-/* Cria o registo do video no Bunny Stream e devolve o guid.
-   O ficheiro em si sobe depois, do browser, por TUS. */
-
-async function streamCriarVideo(titulo) {
-  if (!STREAM_LIBRARY || !STREAM_KEY) {
-    throw new Error('Bunny Stream nao esta configurado no container');
-  }
-  const resposta = await buscar('https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos', {
-    method: 'POST',
-    headers: { 'AccessKey': STREAM_KEY, 'Content-Type': 'application/json' },
-    body: JSON.stringify({ title: texto(titulo).slice(0, 200) || 'Sem titulo' })
-  }, 'Bunny Stream criar video');
-  if (!resposta.ok) {
-    throw new Error('Bunny Stream recusou criar o video (' + resposta.status + '): ' + (await resposta.text()).slice(0, 300));
-  }
-  const dados = await resposta.json();
-  return texto(dados.guid);
-}
-
-/* Assinatura que o browser usa para subir por TUS.
-   sha256(biblioteca + chave + validade + id do video) */
-
-function streamAssinatura(idVideo, validade) {
-  return crypto
-    .createHash('sha256')
-    .update(STREAM_LIBRARY + STREAM_KEY + validade + idVideo)
-    .digest('hex');
-}
-
-async function streamEstado(idVideo) {
-  const resposta = await buscar(
-    'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
-    { headers: { 'AccessKey': STREAM_KEY } },
-    'Bunny Stream estado'
-  );
-  if (!resposta.ok) return null;
-  return await resposta.json();
-}
-
-async function streamApagarVideo(idVideo) {
-  if (!idVideo || !STREAM_LIBRARY || !STREAM_KEY) return false;
-  try {
-    const resposta = await buscar(
-      'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos/' + encodeURIComponent(idVideo),
-      { method: 'DELETE', headers: { 'AccessKey': STREAM_KEY } },
-      'Bunny Stream apagar'
-    );
-    return resposta.ok;
-  } catch (e) {
-    log('Falhou apagar video', idVideo, e.message);
-    return false;
-  }
-}
-
-function urlPlayback(idVideo) {
-  if (!idVideo || !STREAM_CDN) return '';
-  return 'https://' + STREAM_CDN + '/' + idVideo + '/playlist.m3u8';
-}
-
-function urlMiniatura(idVideo) {
-  if (!idVideo || !STREAM_CDN) return '';
-  return 'https://' + STREAM_CDN + '/' + idVideo + '/thumbnail.jpg';
-}
-
-/* Envia bytes para o Bunny Storage e devolve o endereco publico. */
-
-async function storageGuardar(caminho, bytes, tipoMime) {
-  if (!STORAGE_ZONE) throw new Error('STORAGE_ZONE em falta no container');
-  if (!STORAGE_PASSWORD) throw new Error('STORAGE_PASSWORD em falta no container');
-  if (!CDN_HOST) throw new Error('CDN_HOST em falta no container');
-
-  const url = 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho;
-
-  const resposta = await buscar(url, {
-    method: 'PUT',
-    headers: {
-      'AccessKey': STORAGE_PASSWORD,
-      'Content-Type': tipoMime || 'application/octet-stream'
-    },
-    body: bytes
-  }, 'Bunny Storage guardar');
-
-  if (!resposta.ok) {
-    const detalhe = (await resposta.text()).slice(0, 200);
-    if (resposta.status === 401) {
-      throw new Error('Bunny Storage recusou a chave (401). Confirme a STORAGE_PASSWORD — tem de ser a password da zona curc, nao a chave da conta.');
-    }
-    throw new Error('Bunny Storage recusou (' + resposta.status + '): ' + detalhe);
-  }
-
-  return 'https://' + CDN_HOST + '/' + caminho;
-}
-
-async function storageApagar(caminho) {
-  if (!caminho || !STORAGE_ZONE) return false;
-  try {
-    const resposta = await buscar('https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminho, {
-      method: 'DELETE',
-      headers: { 'AccessKey': STORAGE_PASSWORD }
-    }, 'Bunny Storage apagar');
-    return resposta.ok;
-  } catch (e) {
-    return false;
-  }
-}
-
-const IMAGENS_ACEITES = {
-  'image/jpeg': 'jpg',
-  'image/jpg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp'
+var CFG = {
+  API:      'https://mc-nrqyo9ibyg.bunny.run',
+  OWNER:    'ID_DO_UTILIZADOR',
+  NOME:     'NOME_DO_UTILIZADOR',
+  LOGADO:   'no',
+  CATALOGO: '/catalogo',
+  ESPACO:   '/espaco',
+  LOGIN:    '/login'
 };
 
-/* ============================================================
-   5. REGRAS DE NEGOCIO
-   ============================================================ */
-
-function precoEfectivo(curso) {
-  if (curso['E Gratis']) return 0;
-  const promo = numero(curso['Preco Promo MZN']);
-  const base = numero(curso['Preco MZN']);
-  if (promo > 0 && promo < base) return promo;
-  return base;
-}
-
-/* A parte do afiliado sai do que sobra para o formador.
-   A plataforma leva sempre a mesma percentagem. */
-
-function repartir(valorMZN, pctAfiliado) {
-  const comissao = Math.round(valorMZN * (COMISSAO_PCT / 100));
-  const pct = Math.max(0, Math.min(AFILIADO_MAX_PCT, numero(pctAfiliado)));
-  const afiliado = pct > 0 ? Math.round(valorMZN * (pct / 100)) : 0;
-  const liquido = valorMZN - comissao - afiliado;
-
-  /* Rede de seguranca: se as contas nao fecharem, o formador
-     nunca sai a dever — o afiliado e que e cortado. */
-  if (liquido < 0) {
-    return { comissao: comissao, afiliado: Math.max(0, valorMZN - comissao), liquido: 0 };
-  }
-  return { comissao: comissao, afiliado: afiliado, liquido: liquido };
-}
-
-/* ---------- afiliados ---------- */
-
-function comissaoAfiliadoDe(curso) {
-  if (!curso['Aceita Afiliados']) return 0;
-  const pct = numero(curso['Comissao Afiliado Pct']);
-  if (pct <= 0) return 0;
-  return Math.max(AFILIADO_MIN_PCT, Math.min(AFILIADO_MAX_PCT, pct));
-}
-
-async function codigoLivre() {
-  for (let tentativa = 0; tentativa < 8; tentativa++) {
-    const codigo = codigoAleatorio(6);
-    const achados = await bubbleTodos(T.afiliado, [
-      restricao('Codigo', 'equals', codigo)
-    ], { maximo: 1 });
-    if (!achados.length) return codigo;
-  }
-  /* Oito colisoes seguidas nao acontecem, mas se acontecer
-     vale mais um codigo comprido do que um erro. */
-  return codigoAleatorio(10);
-}
-
-async function afiliadoPorCodigo(codigo) {
-  if (!texto(codigo)) return null;
-  const achados = await bubbleTodos(T.afiliado, [
-    restricao('Codigo', 'equals', texto(codigo).toUpperCase()),
-    restricao('Is Active', 'equals', true)
-  ], { maximo: 1 });
-  return achados[0] || null;
-}
-
-/* Confirma que este afiliado pode mesmo receber por esta venda. */
-
-function afiliadoVale(afiliado, curso, idComprador) {
-  if (!afiliado) return false;
-  if (texto(afiliado['Curso']) !== curso._id) return false;
-  if (texto(afiliado['Utilizador']) === idComprador) return false;   /* nao se auto-indica */
-  if (texto(afiliado['Utilizador']) === texto(curso['Formador'])) return false;
-  if (comissaoAfiliadoDe(curso) <= 0) return false;
-  return true;
-}
-
-async function creditarAfiliado(afiliado, valor) {
-  if (!afiliado || valor <= 0) return;
-
-  await bubbleActualizar(T.afiliado, afiliado._id, {
-    'Vendas': numero(afiliado['Vendas']) + 1,
-    'Ganho MZN': numero(afiliado['Ganho MZN']) + valor
-  });
-
-  const pessoa = await bubblePorId(T.user, texto(afiliado['Utilizador']));
-  if (!pessoa) return;
-
-  await bubbleActualizar(T.user, texto(afiliado['Utilizador']), {
-    'Saldo Afiliado MZN': numero(pessoa['Saldo Afiliado MZN']) + valor,
-    'Total Afiliado MZN': numero(pessoa['Total Afiliado MZN']) + valor
-  });
-}
-
-async function inscricaoDe(idAluno, idCurso) {
-  const encontradas = await bubbleTodos(T.inscricao, [
-    restricao('Aluno', 'equals', idAluno),
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1 });
-  return encontradas[0] || null;
-}
-
-async function criarInscricao(aluno, curso, origem, precoPago) {
-  const jaTem = await inscricaoDe(aluno._id, curso._id);
-  if (jaTem) return jaTem._id;
-
-  const id = await bubbleCriar(T.inscricao, {
-    'Aluno': aluno._id,
-    'Curso': curso._id,
-    'Formador': curso['Formador'],
-    'Origem': origem,
-    'Preco Pago MZN': precoPago,
-    'Progresso Pct': 0,
-    'Aulas Concluidas': 0,
-    'Concluido': false,
-    'Is Active': true
-  });
-
-  await bubbleActualizar(T.curso, curso._id, {
-    'Total Alunos': numero(curso['Total Alunos']) + 1
-  });
-
-  return id;
-}
-
-async function creditarFormador(idFormador, liquido) {
-  if (!idFormador || liquido <= 0) return;
-  const formador = await bubblePorId(T.user, idFormador);
-  if (!formador) return;
-  await bubbleActualizar(T.user, idFormador, {
-    'Saldo MZN': numero(formador['Saldo MZN']) + liquido,
-    'Total Ganho MZN': numero(formador['Total Ganho MZN']) + liquido
-  });
-}
-
-/* Confirma que o curso existe e que quem pede e mesmo o dono.
-   Devolve o curso, ou lanca um erro com o motivo. */
-
-async function cursoDoFormador(idDono, idCurso) {
-  if (!idDono) throw new Error('owner em falta');
-  if (!idCurso) throw new Error('curso em falta');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) throw new Error('curso nao encontrado');
-  if (texto(curso['Formador']) !== idDono) throw new Error('este curso nao e seu');
-
-  return curso;
-}
-
-async function formadorActivo(idDono) {
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) throw new Error('utilizador nao encontrado');
-  if (!utilizador['Formador Aprovado']) throw new Error('a sua conta ainda nao e de formador');
-  return utilizador;
-}
-
-/* Recalcula o total de aulas e a duracao a partir das aulas vivas. */
-
-async function recontarCurso(idCurso) {
-  const aulas = await bubbleTodos(T.aula, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1000 });
-
-  const vivas = aulas.filter(function (a) { return !a['Is Deleted']; });
-  const duracao = vivas.reduce(function (soma, a) { return soma + numero(a['Duracao Segundos']); }, 0);
-
-  await bubbleActualizar(T.curso, idCurso, {
-    'Total Aulas': vivas.length,
-    'Duracao Segundos': duracao
-  });
-
-  return { aulas: vivas.length, duracao: duracao };
-}
-
-/* Conta as aulas vivas e as que este aluno ja concluiu.
-   Nao grava nada — so devolve os numeros. */
-
-async function contarProgresso(idAluno, idCurso) {
-  const aulas = (await bubbleTodos(T.aula, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1000 })).filter(function (a) { return !a['Is Deleted']; });
-
-  const vivas = {};
-  aulas.forEach(function (a) { vivas[a._id] = true; });
-
-  const progressos = await bubbleTodos(T.progresso, [
-    restricao('Aluno', 'equals', idAluno),
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1000 });
-
-  /* So contam as aulas que ainda existem. Se o formador apagar uma
-     aula ja vista, a percentagem tem de descer, nao passar dos 100. */
-  const concluidas = progressos.filter(function (p) {
-    return p['Concluida'] && vivas[texto(p['Aula'])];
-  }).length;
-
-  const total = aulas.length;
-
-  return {
-    total: total,
-    concluidas: concluidas,
-    pct: total ? Math.round((concluidas / total) * 100) : 0
-  };
-}
-
-/* Recalcula a media de estrelas de um curso a partir das avaliacoes vivas. */
-
-async function recalcularEstrelas(idCurso) {
-  const todas = (await bubbleTodos(T.avaliacao, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 2000 })).filter(function (a) { return !a['Is Deleted']; });
-
-  const soma = todas.reduce(function (s, a) { return s + numero(a['Estrelas']); }, 0);
-  const media = todas.length ? Math.round((soma / todas.length) * 10) / 10 : 0;
-
-  await bubbleActualizar(T.curso, idCurso, {
-    'Media Estrelas': media,
-    'Total Avaliacoes': todas.length
-  });
-
-  return { media: media, total: todas.length };
-}
-
-/* Confirma que este aluno pode mesmo ver o conteudo do curso.
-   Devolve a inscricao, ou null se for o proprio formador. */
-
-async function acessoAoCurso(idAluno, curso) {
-  if (texto(curso['Formador']) === idAluno) return { dono: true, inscricao: null };
-
-  const inscricao = await inscricaoDe(idAluno, curso._id);
-  if (!inscricao || !inscricao['Is Active']) {
-    throw new Error('nao esta inscrito neste curso');
-  }
-  return { dono: false, inscricao: inscricao };
-}
+var SESSAO = (function(){
+  var v = String(CFG.LOGADO || '').trim().toLowerCase();
+  if (v === 'yes' || v === 'true' || v === 'sim') return true;
+  if (v === 'no' || v === 'false' || v === 'nao' || v === '') return false;
+  return !!(CFG.OWNER && CFG.OWNER.indexOf('ID_DO') !== 0);
+})();
 
 /* ============================================================
-   5B. PLANOS DO FORMADOR
+   ESTADO
    ============================================================ */
 
-/* Regras:
-     Max Cursos = 0  significa ilimitado
-     Bytes Materiais conta capas, fotos e anexos
-     O video nao entra em contagem nenhuma — decisao de produto */
+var st = {
+  categorias: [],
+  cursos: [],
+  curso: null,
+  modulos: [],
+  comissao: 15,
+  planos: [],
+  consumo: null,
+  aderir: { plano: null, metodo: '' },
+  aba: 'detalhes',
+  sondas: {}
+};
 
-function planoPublico(plano, extras) {
-  if (!plano) return null;
-  return Object.assign({
-    id: plano._id,
-    nome: texto(plano['Nome']),
-    slug: texto(plano['Slug']),
-    descricao: texto(plano['Descricao']),
-    max_cursos: numero(plano['Max Cursos']),
-    ilimitado: numero(plano['Max Cursos']) <= 0,
-    bytes: numero(plano['Bytes Materiais']),
-    preco: numero(plano['Preco MZN']),
-    beneficios: plano['Beneficios'] || [],
-    cor: texto(plano['Cor']),
-    ordem: numero(plano['Ordem'])
-  }, extras || {});
+var $ = function(id){ return document.getElementById(id); };
+
+/* ============================================================
+   UTILITARIOS
+   ============================================================ */
+
+function esc(v){
+  return String(v == null ? '' : v)
+    .replace(/&/g,'&amp;').replace(/</g,'&lt;')
+    .replace(/>/g,'&gt;').replace(/"/g,'&quot;');
 }
 
-async function planosActivos() {
-  const lista = await bubbleTodos(T.planoFormador, [
-    restricao('Is Active', 'equals', true)
-  ], { maximo: 50 });
-  return lista.sort(function (a, b) { return numero(a['Ordem']) - numero(b['Ordem']); });
+function mzn(n){
+  return new Intl.NumberFormat('pt-PT').format(Math.round(n || 0)) + ' MZN';
 }
 
-/* O plano de quem ainda nao escolheu nenhum e o mais barato
-   dos activos — na pratica, o gratuito. */
-
-async function planoDoFormador(utilizador) {
-  const id = texto(utilizador && utilizador['Plano Formador']);
-  if (id) {
-    const escolhido = await bubblePorId(T.planoFormador, id);
-    if (escolhido) return escolhido;
-  }
-  const activos = await planosActivos();
-  if (!activos.length) return null;
-
-  const gratis = activos.filter(function (p) { return numero(p['Preco MZN']) <= 0; });
-  return gratis[0] || activos[0];
+function duracao(seg){
+  seg = Math.round(seg || 0);
+  if (!seg) return '—';
+  var h = Math.floor(seg/3600), m = Math.round((seg%3600)/60);
+  return h ? h + 'h ' + m + 'm' : m + ' min';
 }
 
-async function cursosVivosDe(idDono) {
-  const cursos = await bubbleTodos(T.curso, [
-    restricao('Formador', 'equals', idDono)
-  ], { maximo: 500 });
-  return cursos.filter(function (c) { return !c['Is Deleted']; });
-}
-
-/* Devolve o retrato do plano e do consumo, tudo de uma vez. */
-
-async function consumoDe(idDono) {
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) throw new Error('utilizador nao encontrado');
-
-  const plano = await planoDoFormador(utilizador);
-  const cursos = await cursosVivosDe(idDono);
-  const bytes = numero(utilizador['Bytes Usados']);
-
-  const maxCursos = plano ? numero(plano['Max Cursos']) : 1;
-  const maxBytes = plano ? numero(plano['Bytes Materiais']) : 0;
-
-  return {
-    utilizador: utilizador,
-    plano: plano,
-    cursos_usados: cursos.length,
-    cursos_max: maxCursos,
-    cursos_ilimitados: maxCursos <= 0,
-    bytes_usados: bytes,
-    bytes_max: maxBytes,
-    bytes_livres: Math.max(0, maxBytes - bytes)
-  };
-}
-
-/* Trava a criacao de mais um curso quando o plano nao chega. */
-
-async function podeCriarCurso(idDono) {
-  const c = await consumoDe(idDono);
-  if (c.cursos_ilimitados) return { pode: true, consumo: c };
-
-  if (c.cursos_usados >= c.cursos_max) {
-    const nome = c.plano ? texto(c.plano['Nome']) : 'actual';
-    return {
-      pode: false,
-      consumo: c,
-      motivo: 'o plano ' + nome + ' permite ' +
-        c.cursos_max + (c.cursos_max === 1 ? ' curso' : ' cursos') +
-        ' e ja tem ' + c.cursos_usados + '. Mude de plano para criar mais.'
-    };
-  }
-  return { pode: true, consumo: c };
-}
-
-/* Trava o envio de ficheiros quando o espaco nao chega.
-   O tamanho do ficheiro que vai ser substituido nao conta,
-   senao trocar uma capa gastava espaco duas vezes. */
-
-async function podeGuardarBytes(idDono, bytes, bytesQueSaem) {
-  const c = await consumoDe(idDono);
-  const usados = Math.max(0, c.bytes_usados - numero(bytesQueSaem));
-
-  if (c.bytes_max > 0 && usados + bytes > c.bytes_max) {
-    return {
-      pode: false,
-      consumo: c,
-      motivo: 'nao ha espaco no seu plano: ' + emMB(c.bytes_max - usados) +
-        ' livres e este ficheiro tem ' + emMB(bytes) + '. Apague materiais ou mude de plano.'
-    };
-  }
-  return { pode: true, consumo: c, usados: usados };
-}
-
-function emMB(bytes) {
-  const mb = numero(bytes) / (1024 * 1024);
+function tamanho(bytes){
+  var mb = (bytes || 0) / (1024 * 1024);
   if (mb >= 1024) return (Math.round(mb / 102.4) / 10) + ' GB';
   return Math.max(0, Math.round(mb * 10) / 10) + ' MB';
 }
 
-async function somarBytes(idDono, novoTotal) {
-  await bubbleActualizar(T.user, idDono, { 'Bytes Usados': Math.max(0, Math.round(novoTotal)) });
+function aviso(texto, tipo){
+  var el = document.createElement('div');
+  el.className = 'aviso' + (tipo ? ' ' + tipo : '');
+  el.textContent = texto;
+  $('avisos').appendChild(el);
+  setTimeout(function(){ el.remove(); }, 4600);
 }
 
-function cursoPublico(curso) {
-  return {
-    id: curso._id,
-    titulo: texto(curso['Titulo']),
-    slug: texto(curso['Slug']),
-    subtitulo: texto(curso['Subtitulo']),
-    capa: texto(curso['Capa URL']),
-    intro_playback: texto(curso['Intro Playback URL']),
-    intro_thumb: texto(curso['Intro Thumbnail URL']),
-    intro_duracao: numero(curso['Intro Duracao']),
-    categoria: texto(curso['Categoria']),
-    nivel: texto(curso['Nivel']),
-    preco: numero(curso['Preco MZN']),
-    preco_promo: numero(curso['Preco Promo MZN']),
-    preco_final: precoEfectivo(curso),
-    gratis: !!curso['E Gratis'],
-    total_aulas: numero(curso['Total Aulas']),
-    duracao: numero(curso['Duracao Segundos']),
-    total_alunos: numero(curso['Total Alunos']),
-    estrelas: numero(curso['Media Estrelas']),
-    avaliacoes: numero(curso['Total Avaliacoes']),
-    certificado: !!curso['Tem Certificado'],
-    aceita_afiliados: !!curso['Aceita Afiliados'],
-    comissao_afiliado: comissaoAfiliadoDe(curso),
-    formador_id: texto(curso['Formador'])
-  };
+function api(rota, dados){
+  return fetch(CFG.API + rota, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify(Object.assign({ owner: CFG.OWNER }, dados || {}))
+  }).then(function(r){ return r.json(); }).then(function(d){
+    if (!d.ok) throw new Error(d.erro || 'Não deu para completar');
+    return d;
+  });
 }
 
-function formadorPublico(utilizador) {
-  if (!utilizador) return null;
-  return {
-    id: utilizador._id,
-    nome: texto(utilizador['Nome Completo']),
-    foto: texto(utilizador['Foto URL']),
-    bio: texto(utilizador['Bio']),
-    total_cursos: numero(utilizador['Total Cursos']),
-    total_alunos: numero(utilizador['Total Alunos'])
-  };
+function linhas(texto){
+  return String(texto || '').split('\n')
+    .map(function(l){ return l.trim(); })
+    .filter(Boolean);
 }
+
+function irAoTopo(){ window.scrollTo(0, 0); }
 
 /* ============================================================
-   6. ROTAS
+   ARRANQUE
    ============================================================ */
 
-const rotas = {};
-
-/* ---------- estado ---------- */
-
-rotas['GET /'] = async function (req, res) {
-  ok(res, {
-    servico: 'curc-proxy',
-    versao: VERSAO,
-    hora: agora(),
-    bubble: BUBBLE_BASE ? 'configurado' : 'em falta',
-    carteira: MOZ_WALLET ? 'configurada' : 'em falta',
-    storage: (STORAGE_ZONE && STORAGE_PASSWORD && CDN_HOST) ? 'configurado' : 'em falta',
-    stream: (STREAM_LIBRARY && STREAM_KEY && STREAM_CDN) ? 'configurado' : 'em falta',
-    comissao_pct: COMISSAO_PCT,
-    afiliado_min_pct: AFILIADO_MIN_PCT,
-    afiliado_max_pct: AFILIADO_MAX_PCT
-  });
-};
-
-/* ---------- diagnostico da ligacao ao Bubble ---------- */
-
-rotas['POST /diag'] = async function (req, res, corpo) {
-  if (texto(corpo.key) !== UPLOAD_SECRET || !UPLOAD_SECRET) {
-    return erro(res, 'chave invalida', 403);
-  }
-  const relatorio = {};
-  for (const nome of ['user', 'category', 'course', 'lesson', 'enrollment', 'payment']) {
-    try {
-      const pagina = await bubbleListar(nome, [], { limite: 1 });
-      relatorio[nome] = 'ok (' + (pagina.itens.length + pagina.restantes) + ' registos)';
-    } catch (e) {
-      relatorio[nome] = 'FALHOU — ' + e.message;
-    }
-  }
-  ok(res, { versao: VERSAO, tipos: relatorio });
-};
-
-/* ---------- diagnostico do Bunny Storage e Stream ---------- */
-
-/* Nunca devolve a password. So o tamanho, o principio e o fim,
-   que chega para perceber se foi cortada ou colada torta. */
-
-function retrato(nome, valorBruto, valorLimpo) {
-  const bruto = valorBruto === undefined || valorBruto === null ? '' : String(valorBruto);
-  return {
-    variavel: nome,
-    definida: bruto.length > 0,
-    tamanho_bruto: bruto.length,
-    tamanho_limpo: valorLimpo.length,
-    foi_limpo: bruto !== valorLimpo,
-    tinha_espacos: /^\s|\s$/.test(bruto),
-    tinha_aspas: /^["']|["']$/.test(bruto.trim()),
-    tinha_esquema: /^https?:\/\//i.test(bruto.trim()),
-    inicio: valorLimpo.slice(0, 4),
-    fim: valorLimpo.length > 8 ? valorLimpo.slice(-4) : ''
-  };
-}
-
-rotas['POST /diag-storage'] = async function (req, res, corpo) {
-  if (texto(corpo.key) !== UPLOAD_SECRET || !UPLOAD_SECRET) {
-    return erro(res, 'chave invalida', 403);
-  }
-
-  const relatorio = {
-    versao: VERSAO,
-    variaveis: [
-      retrato('STORAGE_ZONE', process.env.STORAGE_ZONE, STORAGE_ZONE),
-      retrato('STORAGE_PASSWORD', process.env.STORAGE_PASSWORD, STORAGE_PASSWORD),
-      retrato('STORAGE_HOST', process.env.STORAGE_HOST, STORAGE_HOST),
-      retrato('CDN_HOST', process.env.CDN_HOST, CDN_HOST),
-      retrato('STREAM_LIBRARY', process.env.STREAM_LIBRARY, STREAM_LIBRARY),
-      retrato('STREAM_KEY', process.env.STREAM_KEY, STREAM_KEY),
-      retrato('STREAM_CDN', process.env.STREAM_CDN, STREAM_CDN)
-    ],
-    url_que_vai_ser_usado: 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/<ficheiro>',
-    passos: {}
-  };
-
-  /* 1. o nome resolve? */
-  try {
-    const achado = await dns.lookup(STORAGE_HOST);
-    relatorio.passos['1_dns'] = 'ok — ' + STORAGE_HOST + ' = ' + achado.address;
-  } catch (e) {
-    relatorio.passos['1_dns'] = 'FALHOU — ' + (e.code || e.message) +
-      '. O container nao consegue resolver este nome. Confirme a STORAGE_HOST.';
-    return ok(res, relatorio);
-  }
-
-  /* 2. escrever mesmo um ficheiro */
-  const caminhoTeste = 'diagnostico/teste-' + Date.now() + '.txt';
-  const urlTeste = 'https://' + STORAGE_HOST + '/' + STORAGE_ZONE + '/' + caminhoTeste;
-
-  try {
-    const resposta = await fetch(urlTeste, {
-      method: 'PUT',
-      headers: { 'AccessKey': STORAGE_PASSWORD, 'Content-Type': 'text/plain' },
-      body: Buffer.from('curc diagnostico ' + agora())
-    });
-    const detalhe = (await resposta.text()).slice(0, 300);
-    relatorio.passos['2_escrita'] = resposta.status + ' — ' + (detalhe || '(sem corpo)');
-
-    if (resposta.status === 401) {
-      relatorio.passos['2_leitura'] = 'a chave nao serve — use a Password da zona curc (FTP & API Access), nao a API Key da conta';
-    }
-    if (resposta.status === 404) {
-      relatorio.passos['2_leitura'] = 'a zona "' + STORAGE_ZONE + '" nao existe neste host — confirme o nome e a regiao';
-    }
-  } catch (e) {
-    relatorio.passos['2_escrita'] = 'REBENTOU — ' + causaDe(e);
-    return ok(res, relatorio);
-  }
-
-  /* 3. ler de volta pelo CDN */
-  if (CDN_HOST) {
-    try {
-      const resposta = await fetch('https://' + CDN_HOST + '/' + caminhoTeste);
-      relatorio.passos['3_cdn'] = resposta.status + ' — https://' + CDN_HOST + '/' + caminhoTeste;
-    } catch (e) {
-      relatorio.passos['3_cdn'] = 'REBENTOU — ' + causaDe(e);
-    }
-  } else {
-    relatorio.passos['3_cdn'] = 'CDN_HOST em falta — o upload ate podia funcionar, mas o URL devolvido ficava partido';
-  }
-
-  /* 4. limpar */
-  try {
-    await fetch(urlTeste, { method: 'DELETE', headers: { 'AccessKey': STORAGE_PASSWORD } });
-    relatorio.passos['4_limpeza'] = 'ficheiro de teste apagado';
-  } catch (e) {
-    relatorio.passos['4_limpeza'] = 'ficou la o ficheiro de teste: ' + caminhoTeste;
-  }
-
-  /* 5. o Stream tambem */
-  if (STREAM_LIBRARY && STREAM_KEY) {
-    try {
-      const resposta = await fetch(
-        'https://video.bunnycdn.com/library/' + STREAM_LIBRARY + '/videos?page=1&itemsPerPage=1',
-        { headers: { 'AccessKey': STREAM_KEY } }
-      );
-      relatorio.passos['5_stream'] = resposta.status === 200
-        ? 'ok — biblioteca ' + STREAM_LIBRARY + ' responde'
-        : resposta.status + ' — ' + (await resposta.text()).slice(0, 200);
-    } catch (e) {
-      relatorio.passos['5_stream'] = 'REBENTOU — ' + causaDe(e);
-    }
-  } else {
-    relatorio.passos['5_stream'] = 'STREAM_LIBRARY ou STREAM_KEY em falta';
-  }
-
-  ok(res, relatorio);
-};
-
-/* ---------- contas ---------- */
-
-rotas['POST /signup-code'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-  const email = texto(utilizador.authentication &&
-    utilizador.authentication.email &&
-    utilizador.authentication.email.email) || texto(utilizador.email);
-
-  if (!email) return erro(res, 'este utilizador nao tem email');
-
-  const codigo = codigoAleatorio(8);
-  const expira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
-
-  const campos = {
-    'Token': codigo,
-    'Token Confirmado': false,
-    'Token Expires': expira
-  };
-
-  /* Conta nova: nome, papel e plano gratuito ficam logo aqui.
-     Assim ninguem chega ao estudio sem plano atribuido. */
-
-  if (!texto(utilizador['Nome Completo']) && texto(corpo.nome)) {
-    campos['Nome Completo'] = texto(corpo.nome).slice(0, 120);
-  }
-  if (!texto(utilizador['Papel'])) {
-    campos['Papel'] = 'Aluno';
-  }
-  if (!texto(utilizador['Plano Formador'])) {
-    const gratuito = await planoDoFormador(null);
-    if (gratuito) {
-      campos['Plano Formador'] = gratuito._id;
-      campos['Plano Desde'] = agora();
-    }
-    campos['Bytes Usados'] = numero(utilizador['Bytes Usados']);
-  }
-
-  await bubbleActualizar(T.user, idDono, campos);
-
-  const enviado = await enviarEmail(
-    email,
-    'O seu codigo CURC: ' + codigo,
-    moldeCodigo(texto(campos['Nome Completo'] || utilizador['Nome Completo']), codigo)
-  );
-
-  ok(res, { enviado: enviado, email: email, plano: texto(campos['Plano Formador']) || '' });
-};
-
-rotas['POST /verify-code'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const codigo = texto(corpo.code).toUpperCase();
-  if (!idDono || !codigo) return erro(res, 'owner ou code em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-  if (utilizador['Token Confirmado']) return ok(res, { confirmado: true, ja: true });
-
-  const guardado = texto(utilizador['Token']).toUpperCase();
-  if (!guardado || guardado !== codigo) return erro(res, 'codigo errado');
-
-  const expira = utilizador['Token Expires'];
-  if (expira && new Date(expira).getTime() < Date.now()) {
-    return erro(res, 'codigo expirado');
-  }
-
-  await bubbleActualizar(T.user, idDono, {
-    'Token Confirmado': true,
-    'Is Active': true,
-    'Token': ''
-  });
-
-  ok(res, { confirmado: true });
-};
-
-rotas['POST /account'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-  const inscricoes = await bubbleTodos(T.inscricao, [
-    restricao('Aluno', 'equals', idDono),
-    restricao('Is Active', 'equals', true)
-  ], { maximo: 500 });
-
-  ok(res, {
-    id: utilizador._id,
-    nome: texto(utilizador['Nome Completo']),
-    foto: texto(utilizador['Foto URL']),
-    bio: texto(utilizador['Bio']),
-    telefone: texto(utilizador['Telefone']),
-    papel: texto(utilizador['Papel']) || 'Aluno',
-    formador_aprovado: !!utilizador['Formador Aprovado'],
-    confirmado: !!utilizador['Token Confirmado'],
-    saldo: numero(utilizador['Saldo MZN']),
-    total_ganho: numero(utilizador['Total Ganho MZN']),
-    saldo_afiliado: numero(utilizador['Saldo Afiliado MZN']),
-    total_afiliado: numero(utilizador['Total Afiliado MZN']),
-    total_cursos: numero(utilizador['Total Cursos']),
-    inscricoes: inscricoes.length,
-    comissao_pct: COMISSAO_PCT
-  });
-};
-
-/* ---------- catalogo ---------- */
-
-rotas['POST /categories'] = async function (req, res) {
-  const lista = await bubbleTodos(T.categoria, [
-    restricao('Is Active', 'equals', true)
-  ], { ordenarPor: 'Ordem', maximo: 100 });
-
-  ok(res, {
-    categorias: lista.map(function (c) {
-      return {
-        id: c._id,
-        nome: texto(c['Nome']),
-        slug: texto(c['Slug']),
-        icone: texto(c['Icone'])
-      };
-    })
-  });
-};
-
-rotas['POST /courses'] = async function (req, res, corpo) {
-  const procura = texto(corpo.q).toLowerCase();
-  const categoria = texto(corpo.categoria);
-  const nivel = texto(corpo.nivel);
-  const soGratis = corpo.gratis === true;
-  const idFormador = texto(corpo.formador);
-  const ordem = texto(corpo.ordem) || 'recentes';
-  const pagina = Math.max(1, numero(corpo.pagina) || 1);
-  const porPagina = Math.min(48, numero(corpo.por_pagina) || 12);
-
-  const restricoes = [restricao('Estado', 'equals', 'Publicado')];
-  if (categoria) restricoes.push(restricao('Categoria', 'equals', categoria));
-  if (nivel) restricoes.push(restricao('Nivel', 'equals', nivel));
-  if (soGratis) restricoes.push(restricao('E Gratis', 'equals', true));
-  if (idFormador) restricoes.push(restricao('Formador', 'equals', idFormador));
-
-  let lista = await bubbleTodos(T.curso, restricoes, { maximo: 500 });
-
-  lista = lista.filter(function (c) { return !c['Is Deleted']; });
-
-  if (procura) {
-    lista = lista.filter(function (c) {
-      const alvo = (texto(c['Titulo']) + ' ' + texto(c['Subtitulo']) + ' ' + texto(c['Descricao'])).toLowerCase();
-      return alvo.indexOf(procura) !== -1;
-    });
-  }
-
-  const ordenadores = {
-    recentes: function (a, b) {
-      return new Date(b['Publicado Data'] || b['Created Date'] || 0) -
-             new Date(a['Publicado Data'] || a['Created Date'] || 0);
-    },
-    populares: function (a, b) { return numero(b['Total Alunos']) - numero(a['Total Alunos']); },
-    estrelas: function (a, b) { return numero(b['Media Estrelas']) - numero(a['Media Estrelas']); },
-    barato: function (a, b) { return precoEfectivo(a) - precoEfectivo(b); },
-    caro: function (a, b) { return precoEfectivo(b) - precoEfectivo(a); }
-  };
-  lista.sort(ordenadores[ordem] || ordenadores.recentes);
-
-  const total = lista.length;
-  const inicio = (pagina - 1) * porPagina;
-  const fatia = lista.slice(inicio, inicio + porPagina);
-
-  const idsFormadores = Array.from(new Set(fatia.map(function (c) { return texto(c['Formador']); }).filter(Boolean)));
-  const formadores = {};
-  for (const id of idsFormadores) {
-    const u = await bubblePorId(T.user, id);
-    if (u) formadores[id] = formadorPublico(u);
-  }
-
-  ok(res, {
-    total: total,
-    pagina: pagina,
-    paginas: Math.ceil(total / porPagina) || 1,
-    cursos: fatia.map(function (c) {
-      const publico = cursoPublico(c);
-      publico.formador = formadores[publico.formador_id] || null;
-      return publico;
-    })
-  });
-};
-
-rotas['POST /course'] = async function (req, res, corpo) {
-  const idCurso = texto(corpo.curso);
-  const idDono = texto(corpo.owner);
-  if (!idCurso) return erro(res, 'curso em falta');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  const eDono = idDono && texto(curso['Formador']) === idDono;
-  if (texto(curso['Estado']) !== 'Publicado' && !eDono) {
-    return erro(res, 'curso nao disponivel', 403);
-  }
-
-  let inscrito = false;
-  if (idDono) {
-    const inscricao = await inscricaoDe(idDono, idCurso);
-    inscrito = !!(inscricao && inscricao['Is Active']);
-  }
-  const acessoTotal = inscrito || eDono;
-
-  const modulos = await bubbleTodos(T.modulo, [
-    restricao('Curso', 'equals', idCurso)
-  ], { ordenarPor: 'Ordem', maximo: 200 });
-
-  const aulas = await bubbleTodos(T.aula, [
-    restricao('Curso', 'equals', idCurso)
-  ], { ordenarPor: 'Ordem', maximo: 1000 });
-
-  const vivas = aulas.filter(function (a) { return !a['Is Deleted']; });
-
-  let vistas = {};
-  if (acessoTotal && idDono) {
-    const progressos = await bubbleTodos(T.progresso, [
-      restricao('Aluno', 'equals', idDono),
-      restricao('Curso', 'equals', idCurso)
-    ], { maximo: 1000 });
-    progressos.forEach(function (p) {
-      vistas[texto(p['Aula'])] = {
-        segundos: numero(p['Segundos Vistos']),
-        concluida: !!p['Concluida']
-      };
-    });
-  }
-
-  const programa = modulos
-    .filter(function (m) { return !m['Is Deleted']; })
-    .map(function (m) {
-      const doModulo = vivas
-        .filter(function (a) { return texto(a['Modulo']) === m._id; })
-        .sort(function (a, b) { return numero(a['Ordem']) - numero(b['Ordem']); })
-        .map(function (a) {
-          const aberta = acessoTotal || !!a['E Livre'];
-          const linha = {
-            id: a._id,
-            titulo: texto(a['Titulo']),
-            tipo: texto(a['Tipo']),
-            duracao: numero(a['Duracao Segundos']),
-            livre: !!a['E Livre'],
-            aberta: aberta,
-            visto: vistas[a._id] || null
-          };
-          /* O conteudo so sai daqui se houver direito a ele. */
-          if (aberta) {
-            linha.playback = texto(a['Playback URL']);
-            linha.thumb = texto(a['Thumbnail URL']);
-          }
-          return linha;
-        });
-      return { id: m._id, nome: texto(m['Nome']), ordem: numero(m['Ordem']), aulas: doModulo };
-    });
-
-  const formador = await bubblePorId(T.user, texto(curso['Formador']));
-
-  const avaliacoes = await bubbleTodos(T.avaliacao, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 200 });
-
-  ok(res, {
-    curso: Object.assign(cursoPublico(curso), {
-      descricao: texto(curso['Descricao']),
-      aprende: curso['O Que Vai Aprender'] || [],
-      requisitos: curso['Requisitos'] || [],
-      estado: texto(curso['Estado'])
-    }),
-    formador: formadorPublico(formador),
-    programa: programa,
-    inscrito: inscrito,
-    e_dono: !!eDono,
-    avaliacoes: avaliacoes
-      .filter(function (a) { return !a['Is Deleted']; })
-      .slice(0, 30)
-      .map(function (a) {
-        return {
-          estrelas: numero(a['Estrelas']),
-          texto: texto(a['Texto']),
-          data: a['Created Date'] || null
-        };
-      })
-  });
-};
-
-/* ---------- inscricao gratis ---------- */
-
-rotas['POST /enroll'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
-
-  const aluno = await bubblePorId(T.user, idDono);
-  if (!aluno) return erro(res, 'utilizador nao encontrado', 404);
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-  if (texto(curso['Estado']) !== 'Publicado') return erro(res, 'curso nao disponivel', 403);
-
-  if (precoEfectivo(curso) > 0) {
-    return erro(res, 'este curso e pago — use /pay');
-  }
-
-  const jaTem = await inscricaoDe(idDono, idCurso);
-  if (jaTem) return ok(res, { inscricao: jaTem._id, ja: true });
-
-  const id = await criarInscricao(aluno, curso, 'gratis', 0);
-  ok(res, { inscricao: id, ja: false });
-};
-
-/* ---------- pagamento por carteira movel ---------- */
-
-rotas['POST /pay'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idItem = texto(corpo.item_id);
-  const tipoItem = texto(corpo.item_type) || 'curso';
-  const numeroBruto = texto(corpo.numero);
-  let metodo = texto(corpo.metodo).toLowerCase();
-
-  if (!idDono || !idItem || !numeroBruto) {
-    return erro(res, 'owner, item_id ou numero em falta');
-  }
-  if (tipoItem !== 'curso') {
-    return erro(res, 'so cursos por agora');
-  }
-
-  const numeroLimpo = normalizarNumero(numeroBruto);
-  if (numeroLimpo.length !== 9) {
-    return erro(res, 'numero invalido — devem ser 9 digitos, por exemplo 841234567');
-  }
-
-  if (!metodo) metodo = operadoraDoNumero(numeroLimpo);
-  if (metodo !== 'mpesa' && metodo !== 'emola') {
-    return erro(res, 'nao reconheci a operadora deste numero — escolha M-Pesa ou e-Mola');
-  }
-
-  const aluno = await bubblePorId(T.user, idDono);
-  if (!aluno) return erro(res, 'utilizador nao encontrado', 404);
-
-  const curso = await bubblePorId(T.curso, idItem);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-  if (texto(curso['Estado']) !== 'Publicado') return erro(res, 'curso nao disponivel', 403);
-  if (texto(curso['Formador']) === idDono) return erro(res, 'este curso e seu');
-
-  const jaTem = await inscricaoDe(idDono, idItem);
-  if (jaTem && jaTem['Is Active']) return erro(res, 'ja tem acesso a este curso');
-
-  let valor = precoEfectivo(curso);
-  if (valor <= 0) return erro(res, 'este curso e gratis — use /enroll');
-
-  /* cupao, se vier */
-  let cupaoUsado = null;
-  const codigoCupao = texto(corpo.cupao).toUpperCase();
-  if (codigoCupao) {
-    const achados = await bubbleTodos(T.cupao, [
-      restricao('Codigo', 'equals', codigoCupao),
-      restricao('Is Active', 'equals', true)
-    ], { maximo: 1 });
-    const cupao = achados[0];
-    if (cupao) {
-      const doCurso = !texto(cupao['Curso']) || texto(cupao['Curso']) === idItem;
-      const dentroDoPrazo = !cupao['Validade'] || new Date(cupao['Validade']).getTime() > Date.now();
-      const temUsos = !numero(cupao['Max Usos']) || numero(cupao['Usos']) < numero(cupao['Max Usos']);
-      if (doCurso && dentroDoPrazo && temUsos) {
-        const desconto = Math.round(valor * (numero(cupao['Desconto Pct']) / 100));
-        valor = Math.max(0, valor - desconto);
-        cupaoUsado = cupao;
-      }
-    }
-  }
-
-  if (valor <= 0) {
-    const id = await criarInscricao(aluno, curso, 'cupao', 0);
-    if (cupaoUsado) {
-      await bubbleActualizar(T.cupao, cupaoUsado._id, { 'Usos': numero(cupaoUsado['Usos']) + 1 });
-    }
-    return ok(res, { pago: true, gratis_por_cupao: true, inscricao: id });
-  }
-
-  const nomeCliente = texto(aluno['Nome Completo']) || 'Cliente CURC';
-
-  /* Quem indicou esta venda, se alguem indicou. */
-  let afiliado = await afiliadoPorCodigo(corpo.ref);
-  if (afiliado && !afiliadoVale(afiliado, curso, idDono)) afiliado = null;
-
-  const pctAfiliado = afiliado ? comissaoAfiliadoDe(curso) : 0;
-
-  const resultado = await cobrarCarteira(metodo, numeroLimpo, nomeCliente, valor);
-  const reparticao = repartir(valor, pctAfiliado);
-
-  const idPagamento = await bubbleCriar(T.pagamento, {
-    'User': idDono,
-    'Metodo': metodo,
-    'Telefone': numeroLimpo,
-    'Valor MZN': valor,
-    'Item Type': 'curso',
-    'Item Name': texto(curso['Titulo']),
-    'Item ID': idItem,
-    'Estado': resultado.sucesso ? 'Pago' : 'Falhou',
-    'Transaction': resultado.transacao,
-    'Message': resultado.mensagem,
-    'Raw': resultado.bruto,
-    'Formador': texto(curso['Formador']),
-    'Comissao MZN': resultado.sucesso ? reparticao.comissao : 0,
-    'Liquido MZN': resultado.sucesso ? reparticao.liquido : 0,
-    'Afiliado': afiliado ? texto(afiliado['Utilizador']) : '',
-    'Afiliado MZN': resultado.sucesso ? reparticao.afiliado : 0,
-    'Ref Codigo': afiliado ? texto(afiliado['Codigo']) : ''
-  });
-
-  if (!resultado.sucesso) {
-    return responder(res, 200, {
-      ok: false,
-      pago: false,
-      erro: resultado.mensagem,
-      codigo: resultado.codigo,
-      pagamento: idPagamento
-    });
-  }
-
-  const idInscricao = await criarInscricao(aluno, curso, 'compra', valor);
-  await creditarFormador(texto(curso['Formador']), reparticao.liquido);
-  if (afiliado) await creditarAfiliado(afiliado, reparticao.afiliado);
-
-  if (cupaoUsado) {
-    await bubbleActualizar(T.cupao, cupaoUsado._id, { 'Usos': numero(cupaoUsado['Usos']) + 1 });
-  }
-
-  log('Pagamento aceite', metodo, valor, 'MZN — curso', idItem,
-      afiliado ? '(afiliado ' + texto(afiliado['Codigo']) + ')' : '');
-
-  ok(res, {
-    pago: true,
-    valor: valor,
-    transacao: resultado.transacao,
-    pagamento: idPagamento,
-    inscricao: idInscricao,
-    afiliado: !!afiliado
-  });
-};
-
-/* ---------- os meus cursos ---------- */
-
-rotas['POST /my-courses'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const inscricoes = await bubbleTodos(T.inscricao, [
-    restricao('Aluno', 'equals', idDono),
-    restricao('Is Active', 'equals', true)
-  ], { maximo: 500 });
-
-  const saida = [];
-  for (const inscricao of inscricoes) {
-    const curso = await bubblePorId(T.curso, texto(inscricao['Curso']));
-    if (!curso || curso['Is Deleted']) continue;
-    const publico = cursoPublico(curso);
-    publico.progresso = numero(inscricao['Progresso Pct']);
-    publico.aulas_concluidas = numero(inscricao['Aulas Concluidas']);
-    publico.ultima_aula = texto(inscricao['Ultima Aula']);
-    publico.concluido = !!inscricao['Concluido'];
-    saida.push(publico);
-  }
-
-  ok(res, { cursos: saida });
-};
-
-/* ============================================================
-   6A. LEITOR DO ALUNO
-   ============================================================ */
-
-/* Uma aula com o conteudo. O direito a ver e verificado aqui,
-   nao no browser. Uma aula marcada como livre abre a qualquer um. */
-
-rotas['POST /lesson'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idAula = texto(corpo.aula);
-  if (!idAula) return erro(res, 'aula em falta');
-
-  const aula = await bubblePorId(T.aula, idAula);
-  if (!aula || aula['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
-
-  const curso = await bubblePorId(T.curso, texto(aula['Curso']));
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  const eDono = idDono && texto(curso['Formador']) === idDono;
-  let inscricao = null;
-
-  if (!eDono && !aula['E Livre']) {
-    if (!idDono) return erro(res, 'entre na sua conta para ver esta aula', 403);
-    inscricao = await inscricaoDe(idDono, curso._id);
-    if (!inscricao || !inscricao['Is Active']) {
-      return erro(res, 'precisa de se inscrever para ver esta aula', 403);
-    }
-  }
-
-  let visto = null;
-  if (idDono) {
-    const achados = await bubbleTodos(T.progresso, [
-      restricao('Aluno', 'equals', idDono),
-      restricao('Aula', 'equals', idAula)
-    ], { maximo: 1 });
-    if (achados[0]) {
-      visto = {
-        segundos: numero(achados[0]['Segundos Vistos']),
-        concluida: !!achados[0]['Concluida']
-      };
-    }
-  }
-
-  ok(res, {
-    aula: {
-      id: aula._id,
-      curso: texto(aula['Curso']),
-      modulo: texto(aula['Modulo']),
-      titulo: texto(aula['Titulo']),
-      descricao: texto(aula['Descricao']),
-      tipo: texto(aula['Tipo']),
-      texto: texto(aula['Texto']),
-      duracao: numero(aula['Duracao Segundos']),
-      livre: !!aula['E Livre'],
-      playback: texto(aula['Playback URL']),
-      thumb: texto(aula['Thumbnail URL']),
-      estado_video: texto(aula['Estado Video'])
-    },
-    visto: visto,
-    e_dono: !!eDono
-  });
-};
-
-/* Grava onde o aluno vai na aula e recalcula a inscricao.
-   Chamado de tempos a tempos pelo leitor, e ao marcar como concluida. */
-
-rotas['POST /progress'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idAula = texto(corpo.aula);
-  const segundos = Math.max(0, Math.round(numero(corpo.segundos)));
-  const marcar = Object.prototype.hasOwnProperty.call(corpo, 'concluida');
-
-  if (!idDono || !idAula) return erro(res, 'owner ou aula em falta');
-
-  const aula = await bubblePorId(T.aula, idAula);
-  if (!aula || aula['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
-
-  const idCurso = texto(aula['Curso']);
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  let direito;
-  try {
-    direito = await acessoAoCurso(idDono, curso);
-  } catch (e) {
-    return erro(res, e.message, 403);
-  }
-
-  /* O formador ve as suas proprias aulas mas nao acumula progresso. */
-  if (direito.dono) {
-    return ok(res, { gravado: false, motivo: 'e o formador deste curso' });
-  }
-
-  const achados = await bubbleTodos(T.progresso, [
-    restricao('Aluno', 'equals', idDono),
-    restricao('Aula', 'equals', idAula)
-  ], { maximo: 1 });
-
-  const anterior = achados[0] || null;
-  const duracao = numero(aula['Duracao Segundos']);
-
-  /* A aula da-se por vista aos 90 por cento, ou se o leitor disser
-     explicitamente que acabou. Nunca desmarca sozinha. */
-  let concluida = anterior ? !!anterior['Concluida'] : false;
-  if (marcar) concluida = corpo.concluida === true;
-  else if (duracao > 0 && segundos >= duracao * 0.9) concluida = true;
-
-  /* O contador nunca anda para tras — se a pessoa voltar ao inicio,
-     o ponto de retoma mais adiantado mantem-se. */
-  const guardados = anterior
-    ? Math.max(numero(anterior['Segundos Vistos']), segundos)
-    : segundos;
-
-  if (anterior) {
-    await bubbleActualizar(T.progresso, anterior._id, {
-      'Segundos Vistos': guardados,
-      'Concluida': concluida
-    });
-  } else {
-    await bubbleCriar(T.progresso, {
-      'Aluno': idDono,
-      'Curso': idCurso,
-      'Aula': idAula,
-      'Segundos Vistos': guardados,
-      'Concluida': concluida
-    });
-  }
-
-  const contagem = await contarProgresso(idDono, idCurso);
-  const acabou = contagem.total > 0 && contagem.concluidas >= contagem.total;
-
-  const campos = {
-    'Progresso Pct': contagem.pct,
-    'Aulas Concluidas': contagem.concluidas,
-    'Ultima Aula': idAula,
-    'Concluido': acabou
-  };
-  if (acabou && !direito.inscricao['Concluido']) {
-    campos['Concluido Data'] = agora();
-  }
-
-  await bubbleActualizar(T.inscricao, direito.inscricao._id, campos);
-
-  ok(res, {
-    gravado: true,
-    segundos: guardados,
-    concluida: concluida,
-    pct: contagem.pct,
-    aulas_concluidas: contagem.concluidas,
-    total_aulas: contagem.total,
-    curso_concluido: acabou
-  });
-};
-
-/* Avaliar o curso. Uma avaliacao por aluno — a segunda substitui a primeira. */
-
-rotas['POST /review'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const estrelas = Math.round(numero(corpo.estrelas));
-  const comentario = texto(corpo.texto).slice(0, 1500);
-
-  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
-  if (estrelas < 1 || estrelas > 5) return erro(res, 'as estrelas vao de 1 a 5');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-  if (texto(curso['Formador']) === idDono) return erro(res, 'nao pode avaliar o seu proprio curso');
-
-  const inscricao = await inscricaoDe(idDono, idCurso);
-  if (!inscricao || !inscricao['Is Active']) {
-    return erro(res, 'so quem esta inscrito pode avaliar', 403);
-  }
-
-  const achadas = await bubbleTodos(T.avaliacao, [
-    restricao('Aluno', 'equals', idDono),
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1 });
-
-  if (achadas[0]) {
-    await bubbleActualizar(T.avaliacao, achadas[0]._id, {
-      'Estrelas': estrelas,
-      'Texto': comentario,
-      'Is Deleted': false
-    });
-  } else {
-    await bubbleCriar(T.avaliacao, {
-      'Aluno': idDono,
-      'Curso': idCurso,
-      'Formador': texto(curso['Formador']),
-      'Estrelas': estrelas,
-      'Texto': comentario,
-      'Is Deleted': false
-    });
-  }
-
-  const media = await recalcularEstrelas(idCurso);
-
-  ok(res, {
-    avaliado: true,
-    substituiu: !!achadas[0],
-    media: media.media,
-    total: media.total
-  });
-};
-
-/* O que este aluno ja avaliou, para o leitor mostrar as estrelas dele. */
-
-rotas['POST /my-reviews'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const minhas = (await bubbleTodos(T.avaliacao, [
-    restricao('Aluno', 'equals', idDono)
-  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
-
-  const saida = {};
-  minhas.forEach(function (a) {
-    saida[texto(a['Curso'])] = {
-      estrelas: numero(a['Estrelas']),
-      texto: texto(a['Texto'])
-    };
-  });
-
-  ok(res, { avaliacoes: saida });
-};
-
-/* ============================================================
-   6C. AFILIADOS
-   ============================================================ */
-
-/* Gera, ou devolve, o link desta pessoa para este curso.
-   Qualquer pessoa com conta pode ser afiliada de qualquer
-   curso que aceite afiliados. */
-
-rotas['POST /affiliate-link'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
-
-  const pessoa = await bubblePorId(T.user, idDono);
-  if (!pessoa) return erro(res, 'utilizador nao encontrado', 404);
-  if (!pessoa['Token Confirmado']) return erro(res, 'confirme primeiro o seu email');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-  if (texto(curso['Estado']) !== 'Publicado') return erro(res, 'curso nao disponivel', 403);
-
-  const pct = comissaoAfiliadoDe(curso);
-  if (pct <= 0) return erro(res, 'este curso nao aceita afiliados');
-  if (texto(curso['Formador']) === idDono) return erro(res, 'este curso e seu');
-
-  const jaTem = await bubbleTodos(T.afiliado, [
-    restricao('Utilizador', 'equals', idDono),
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1 });
-
-  let registo = jaTem[0];
-
-  if (registo) {
-    /* Reactiva em silencio se tinha sido desligado. */
-    if (!registo['Is Active']) {
-      await bubbleActualizar(T.afiliado, registo._id, { 'Is Active': true });
-    }
-  } else {
-    const codigo = await codigoLivre();
-    const idNovo = await bubbleCriar(T.afiliado, {
-      'Utilizador': idDono,
-      'Curso': idCurso,
-      'Formador': texto(curso['Formador']),
-      'Codigo': codigo,
-      'Cliques': 0,
-      'Vendas': 0,
-      'Ganho MZN': 0,
-      'Is Active': true
-    });
-    registo = { _id: idNovo, 'Codigo': codigo, 'Cliques': 0, 'Vendas': 0, 'Ganho MZN': 0 };
-  }
-
-  const codigo = texto(registo['Codigo']);
-  const preco = precoEfectivo(curso);
-
-  ok(res, {
-    codigo: codigo,
-    curso: idCurso,
-    titulo: texto(curso['Titulo']),
-    comissao_pct: pct,
-    por_venda: Math.round(preco * (pct / 100)),
-    preco: preco,
-    cliques: numero(registo['Cliques']),
-    vendas: numero(registo['Vendas']),
-    ganho: numero(registo['Ganho MZN']),
-    caminho: '?curso=' + encodeURIComponent(idCurso) + '&ref=' + encodeURIComponent(codigo)
-  });
-};
-
-/* Conta um clique. Publica de proposito — quem visita o link
-   ainda nao tem sessao nenhuma. */
-
-rotas['POST /affiliate-hit'] = async function (req, res, corpo) {
-  const codigo = texto(corpo.ref).toUpperCase();
-  if (!codigo) return erro(res, 'ref em falta');
-
-  const afiliado = await afiliadoPorCodigo(codigo);
-  if (!afiliado) return ok(res, { contado: false });
-
-  await bubbleActualizar(T.afiliado, afiliado._id, {
-    'Cliques': numero(afiliado['Cliques']) + 1
-  });
-
-  ok(res, { contado: true, curso: texto(afiliado['Curso']) });
-};
-
-/* O painel de quem promove. */
-
-rotas['POST /my-affiliates'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const pessoa = await bubblePorId(T.user, idDono);
-  if (!pessoa) return erro(res, 'utilizador nao encontrado', 404);
-
-  const meus = await bubbleTodos(T.afiliado, [
-    restricao('Utilizador', 'equals', idDono)
-  ], { maximo: 300 });
-
-  const linhas = [];
-  for (const a of meus) {
-    const curso = await bubblePorId(T.curso, texto(a['Curso']));
-    if (!curso || curso['Is Deleted']) continue;
-
-    const pct = comissaoAfiliadoDe(curso);
-    const preco = precoEfectivo(curso);
-
-    linhas.push({
-      id: a._id,
-      codigo: texto(a['Codigo']),
-      curso: curso._id,
-      titulo: texto(curso['Titulo']),
-      capa: texto(curso['Capa URL']),
-      publicado: texto(curso['Estado']) === 'Publicado',
-      aceita: pct > 0,
-      comissao_pct: pct,
-      preco: preco,
-      por_venda: Math.round(preco * (pct / 100)),
-      cliques: numero(a['Cliques']),
-      vendas: numero(a['Vendas']),
-      ganho: numero(a['Ganho MZN']),
-      activo: !!a['Is Active'],
-      caminho: '?curso=' + encodeURIComponent(curso._id) + '&ref=' + encodeURIComponent(texto(a['Codigo']))
-    });
-  }
-
-  linhas.sort(function (a, b) { return b.ganho - a.ganho || b.cliques - a.cliques; });
-
-  ok(res, {
-    links: linhas,
-    saldo: numero(pessoa['Saldo Afiliado MZN']),
-    total_ganho: numero(pessoa['Total Afiliado MZN']),
-    cliques: linhas.reduce(function (s, l) { return s + l.cliques; }, 0),
-    vendas: linhas.reduce(function (s, l) { return s + l.vendas; }, 0),
-    min_pct: AFILIADO_MIN_PCT,
-    max_pct: AFILIADO_MAX_PCT
-  });
-};
-
-/* Quem promove um curso meu, visto do lado do formador. */
-
-rotas['POST /course-affiliates'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-
-  const curso = await cursoDoFormador(idDono, idCurso);
-
-  const lista = await bubbleTodos(T.afiliado, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 500 });
-
-  const linhas = [];
-  for (const a of lista) {
-    const pessoa = await bubblePorId(T.user, texto(a['Utilizador']));
-    linhas.push({
-      nome: pessoa ? texto(pessoa['Nome Completo']) : 'Sem nome',
-      foto: pessoa ? texto(pessoa['Foto URL']) : '',
-      codigo: texto(a['Codigo']),
-      cliques: numero(a['Cliques']),
-      vendas: numero(a['Vendas']),
-      ganho: numero(a['Ganho MZN']),
-      activo: !!a['Is Active']
-    });
-  }
-
-  linhas.sort(function (a, b) { return b.vendas - a.vendas || b.cliques - a.cliques; });
-
-  ok(res, {
-    aceita: !!curso['Aceita Afiliados'],
-    comissao_pct: comissaoAfiliadoDe(curso),
-    min_pct: AFILIADO_MIN_PCT,
-    max_pct: AFILIADO_MAX_PCT,
-    afiliados: linhas,
-    cliques: linhas.reduce(function (s, l) { return s + l.cliques; }, 0),
-    vendas: linhas.reduce(function (s, l) { return s + l.vendas; }, 0),
-    pago: linhas.reduce(function (s, l) { return s + l.ganho; }, 0)
-  });
-};
-
-/* ============================================================
-   6D. AREA DE MEMBRO DO CURSO
-   ============================================================ */
-
-/* Ficheiros de apoio. Nao aceito executaveis nem arquivos —
-   nao ha razao para um curso precisar deles e sao um risco. */
-
-const MATERIAIS_ACEITES = {
-  'application/pdf': 'pdf',
-  'application/msword': 'doc',
-  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
-  'application/vnd.ms-excel': 'xls',
-  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
-  'application/vnd.ms-powerpoint': 'ppt',
-  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
-  'text/plain': 'txt',
-  'text/csv': 'csv',
-  'image/jpeg': 'jpg',
-  'image/png': 'png',
-  'image/webp': 'webp',
-  'audio/mpeg': 'mp3',
-  'audio/mp4': 'm4a'
-};
-
-/* Um nome de ficheiro que sobreviva ao caminho do Bunny. */
-
-function nomeSeguro(valor, extensao) {
-  const limpo = texto(valor)
-    .normalize('NFD')
-    .replace(/[\u0300-\u036f]/g, '')
-    .replace(/[^a-zA-Z0-9._ -]/g, '')
-    .replace(/\s+/g, '-')
-    .replace(/-+/g, '-')
-    .replace(/\.{2,}/g, '.')      /* .. nunca chega ao caminho */
-    .replace(/^[.-]+/, '')        /* nem nomes escondidos */
-    .slice(0, 70);
-  const semExtensao = limpo.replace(/\.[^.]*$/, '').replace(/[.-]+$/, '') || 'ficheiro';
-  return semExtensao + '.' + extensao;
-}
-
-function anuncioPublico(a) {
-  return {
-    id: a._id,
-    titulo: texto(a['Titulo']),
-    texto: texto(a['Texto']),
-    fixado: !!a['Fixado'],
-    data: a['Created Date'] || null
-  };
-}
-
-function materialPublico(m) {
-  return {
-    id: m._id,
-    nome: texto(m['Nome']),
-    tipo: texto(m['Tipo']),
-    url: texto(m['URL']),
-    bytes: numero(m['Bytes']),
-    aula: texto(m['Aula']),
-    data: m['Created Date'] || null
-  };
-}
-
-/* Tudo o que a area de membro precisa, numa chamada so.
-   Com rede fraca, cinco pedidos separados sao cinco hipoteses
-   de falhar. */
-
-rotas['POST /space'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  let direito;
-  try {
-    direito = await acessoAoCurso(idDono, curso);
-  } catch (e) {
-    return erro(res, e.message, 403);
-  }
-
-  const avisos = (await bubbleTodos(T.anuncio, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 200 })).filter(function (a) { return !a['Is Deleted']; });
-
-  avisos.sort(function (a, b) {
-    if (!!b['Fixado'] !== !!a['Fixado']) return b['Fixado'] ? 1 : -1;
-    return new Date(b['Created Date'] || 0) - new Date(a['Created Date'] || 0);
-  });
-
-  const materiais = (await bubbleTodos(T.material, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 300 })).filter(function (m) { return !m['Is Deleted']; });
-
-  const duvidas = (await bubbleTodos(T.duvida, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 300 })).filter(function (d) { return !d['Is Deleted']; });
-
-  duvidas.sort(function (a, b) {
-    return new Date(b['Created Date'] || 0) - new Date(a['Created Date'] || 0);
-  });
-
-  /* As respostas vem todas de uma vez e agrupam-se aqui,
-     em vez de uma chamada por duvida. */
-  const respostas = (await bubbleTodos(T.resposta, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 1000 })).filter(function (r) { return !r['Is Deleted']; });
-
-  const nomes = {};
-  const porPessoa = Array.from(new Set(
-    duvidas.map(function (d) { return texto(d['Aluno']); })
-      .concat(respostas.map(function (r) { return texto(r['Autor']); }))
-      .filter(Boolean)
-  ));
-  for (const id of porPessoa) {
-    const p = await bubblePorId(T.user, id);
-    nomes[id] = p ? { nome: texto(p['Nome Completo']), foto: texto(p['Foto URL']) } : null;
-  }
-
-  const agrupadas = {};
-  respostas.forEach(function (r) {
-    const chave = texto(r['Duvida']);
-    if (!agrupadas[chave]) agrupadas[chave] = [];
-    const quem = nomes[texto(r['Autor'])] || {};
-    agrupadas[chave].push({
-      id: r._id,
-      texto: texto(r['Texto']),
-      autor: quem.nome || 'Alguém',
-      foto: quem.foto || '',
-      do_formador: !!r['E Formador'],
-      meu: texto(r['Autor']) === idDono,
-      data: r['Created Date'] || null
-    });
-  });
-
-  Object.keys(agrupadas).forEach(function (k) {
-    agrupadas[k].sort(function (a, b) {
-      return new Date(a.data || 0) - new Date(b.data || 0);
-    });
-  });
-
-  const formador = await bubblePorId(T.user, texto(curso['Formador']));
-
-  ok(res, {
-    curso: {
-      id: curso._id,
-      titulo: texto(curso['Titulo']),
-      capa: texto(curso['Capa URL']),
-      cor: texto(curso['Cor Marca']),
-      logo: texto(curso['Logo URL']),
-      boas_vindas: texto(curso['Boas Vindas']),
-      total_aulas: numero(curso['Total Aulas']),
-      duracao: numero(curso['Duracao Segundos'])
-    },
-    formador: formadorPublico(formador),
-    e_dono: !!direito.dono,
-    inscricao: direito.inscricao ? {
-      progresso: numero(direito.inscricao['Progresso Pct']),
-      aulas_concluidas: numero(direito.inscricao['Aulas Concluidas']),
-      concluido: !!direito.inscricao['Concluido'],
-      ultima_aula: texto(direito.inscricao['Ultima Aula'])
-    } : null,
-    avisos: avisos.map(anuncioPublico),
-    materiais: materiais.map(materialPublico),
-    duvidas: duvidas.map(function (d) {
-      const quem = nomes[texto(d['Aluno'])] || {};
-      return {
-        id: d._id,
-        texto: texto(d['Texto']),
-        aula: texto(d['Aula']),
-        autor: quem.nome || 'Alguém',
-        foto: quem.foto || '',
-        meu: texto(d['Aluno']) === idDono,
-        respondida: !!d['Respondida'],
-        data: d['Created Date'] || null,
-        respostas: agrupadas[d._id] || []
-      };
-    })
-  });
-};
-
-/* ---------- avisos do formador ---------- */
-
-rotas['POST /announce'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idAviso = texto(corpo.aviso);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const titulo = texto(corpo.titulo).slice(0, 140);
-  const conteudo = texto(corpo.texto).slice(0, 4000);
-  if (!titulo && !conteudo) return erro(res, 'o aviso precisa de titulo ou texto');
-
-  const campos = {
-    'Titulo': titulo,
-    'Texto': conteudo,
-    'Fixado': corpo.fixado === true
-  };
-
-  if (idAviso) {
-    const aviso = await bubblePorId(T.anuncio, idAviso);
-    if (!aviso || texto(aviso['Curso']) !== idCurso) return erro(res, 'aviso nao encontrado', 404);
-    await bubbleActualizar(T.anuncio, idAviso, campos);
-    return ok(res, { aviso: idAviso, novo: false });
-  }
-
-  campos['Curso'] = idCurso;
-  campos['Formador'] = idDono;
-  campos['Is Deleted'] = false;
-
-  const novo = await bubbleCriar(T.anuncio, campos);
-  ok(res, { aviso: novo, novo: true });
-};
-
-rotas['POST /announce-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idAviso = texto(corpo.aviso);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const aviso = await bubblePorId(T.anuncio, idAviso);
-  if (!aviso || texto(aviso['Curso']) !== idCurso) return erro(res, 'aviso nao encontrado', 404);
-
-  await bubbleActualizar(T.anuncio, idAviso, { 'Is Deleted': true });
-  ok(res, { apagado: true });
-};
-
-/* ---------- duvidas ---------- */
-
-rotas['POST /ask'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const conteudo = texto(corpo.texto).slice(0, 2000);
-
-  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
-  if (conteudo.length < 3) return erro(res, 'escreva a sua duvida');
-
-  const curso = await bubblePorId(T.curso, idCurso);
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  try {
-    await acessoAoCurso(idDono, curso);
-  } catch (e) {
-    return erro(res, e.message, 403);
-  }
-
-  const id = await bubbleCriar(T.duvida, {
-    'Curso': idCurso,
-    'Aluno': idDono,
-    'Aula': texto(corpo.aula),
-    'Formador': texto(curso['Formador']),
-    'Texto': conteudo,
-    'Respondida': false,
-    'Is Deleted': false
-  });
-
-  ok(res, { duvida: id });
-};
-
-rotas['POST /answer'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idDuvida = texto(corpo.duvida);
-  const conteudo = texto(corpo.texto).slice(0, 2000);
-
-  if (!idDono || !idDuvida) return erro(res, 'owner ou duvida em falta');
-  if (conteudo.length < 2) return erro(res, 'escreva a resposta');
-
-  const duvida = await bubblePorId(T.duvida, idDuvida);
-  if (!duvida || duvida['Is Deleted']) return erro(res, 'duvida nao encontrada', 404);
-
-  const curso = await bubblePorId(T.curso, texto(duvida['Curso']));
-  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
-
-  let direito;
-  try {
-    direito = await acessoAoCurso(idDono, curso);
-  } catch (e) {
-    return erro(res, e.message, 403);
-  }
-
-  const id = await bubbleCriar(T.resposta, {
-    'Duvida': idDuvida,
-    'Curso': curso._id,
-    'Autor': idDono,
-    'Texto': conteudo,
-    'E Formador': !!direito.dono,
-    'Is Deleted': false
-  });
-
-  /* So a resposta do formador fecha a duvida. */
-  if (direito.dono && !duvida['Respondida']) {
-    await bubbleActualizar(T.duvida, idDuvida, { 'Respondida': true });
-  }
-
-  ok(res, { resposta: id, do_formador: !!direito.dono });
-};
-
-/* Cada um apaga o que escreveu. O formador apaga o que quiser
-   no curso dele — e ele que responde por aquele espaco. */
-
-rotas['POST /question-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idDuvida = texto(corpo.duvida);
-  const idResposta = texto(corpo.resposta);
-
-  if (!idDono) return erro(res, 'owner em falta');
-
-  if (idResposta) {
-    const resposta = await bubblePorId(T.resposta, idResposta);
-    if (!resposta || resposta['Is Deleted']) return erro(res, 'resposta nao encontrada', 404);
-
-    const curso = await bubblePorId(T.curso, texto(resposta['Curso']));
-    const eDono = curso && texto(curso['Formador']) === idDono;
-    if (texto(resposta['Autor']) !== idDono && !eDono) {
-      return erro(res, 'nao pode apagar isto', 403);
-    }
-
-    await bubbleActualizar(T.resposta, idResposta, { 'Is Deleted': true });
-    return ok(res, { apagado: 'resposta' });
-  }
-
-  const duvida = await bubblePorId(T.duvida, idDuvida);
-  if (!duvida || duvida['Is Deleted']) return erro(res, 'duvida nao encontrada', 404);
-
-  const curso = await bubblePorId(T.curso, texto(duvida['Curso']));
-  const eDono = curso && texto(curso['Formador']) === idDono;
-  if (texto(duvida['Aluno']) !== idDono && !eDono) {
-    return erro(res, 'nao pode apagar isto', 403);
-  }
-
-  await bubbleActualizar(T.duvida, idDuvida, { 'Is Deleted': true });
-  ok(res, { apagado: 'duvida' });
-};
-
-/* ---------- materiais ---------- */
-
-rotas['POST /material-upload'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const tipoMime = texto(corpo.mime).toLowerCase();
-  const base64 = texto(corpo.dados);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  if (!base64) return erro(res, 'ficheiro em falta');
-
-  const extensao = MATERIAIS_ACEITES[tipoMime];
-  if (!extensao) {
-    return erro(res, 'tipo de ficheiro nao aceite. Use PDF, Word, Excel, PowerPoint, texto, imagem ou audio');
-  }
-
-  const bytes = Buffer.from(base64.replace(/^data:[^,]+,/, ''), 'base64');
-  if (!bytes.length) return erro(res, 'ficheiro vazio');
-  if (bytes.length > 25 * 1024 * 1024) return erro(res, 'o ficheiro passa dos 25 MB');
-
-  const cabe = await podeGuardarBytes(idDono, bytes.length, 0);
-  if (!cabe.pode) return erro(res, cabe.motivo);
-
-  const nome = nomeSeguro(corpo.nome, extensao);
-  const caminho = 'materiais/' + idCurso + '/' + Date.now() + '-' + nome;
-
-  const url = await storageGuardar(caminho, bytes, tipoMime);
-
-  const id = await bubbleCriar(T.material, {
-    'Curso': idCurso,
-    'Formador': idDono,
-    'Aula': texto(corpo.aula),
-    'Nome': texto(corpo.nome).slice(0, 140) || nome,
-    'Tipo': extensao,
-    'URL': url,
-    'Path': caminho,
-    'Bytes': bytes.length,
-    'Is Deleted': false
-  });
-
-  await somarBytes(idDono, cabe.usados + bytes.length);
-
-  ok(res, {
-    material: id,
-    url: url,
-    nome: texto(corpo.nome) || nome,
-    tipo: extensao,
-    bytes: bytes.length,
-    bytes_usados: cabe.usados + bytes.length
-  });
-};
-
-rotas['POST /material-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idMaterial = texto(corpo.material);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const material = await bubblePorId(T.material, idMaterial);
-  if (!material || texto(material['Curso']) !== idCurso) {
-    return erro(res, 'material nao encontrado', 404);
-  }
-
-  const caminho = texto(material['Path']);
-  const bytes = numero(material['Bytes']);
-
-  if (caminho) await storageApagar(caminho);
-  await bubbleActualizar(T.material, idMaterial, { 'Is Deleted': true });
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (utilizador && bytes > 0) {
-    await somarBytes(idDono, numero(utilizador['Bytes Usados']) - bytes);
-  }
-
-  ok(res, { apagado: true, libertou: emMB(bytes) });
-};
-
-/* O formador ve tudo do lado dele, mesmo o que ainda nao publicou. */
-
-rotas['POST /studio-space'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-
-  const curso = await cursoDoFormador(idDono, idCurso);
-
-  const avisos = (await bubbleTodos(T.anuncio, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 200 })).filter(function (a) { return !a['Is Deleted']; });
-
-  const materiais = (await bubbleTodos(T.material, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 300 })).filter(function (m) { return !m['Is Deleted']; });
-
-  const duvidas = (await bubbleTodos(T.duvida, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 300 })).filter(function (d) { return !d['Is Deleted']; });
-
-  const porResponder = duvidas.filter(function (d) { return !d['Respondida']; }).length;
-
-  ok(res, {
-    marca: {
-      cor: texto(curso['Cor Marca']),
-      logo: texto(curso['Logo URL']),
-      boas_vindas: texto(curso['Boas Vindas'])
-    },
-    avisos: avisos.map(anuncioPublico),
-    materiais: materiais.map(materialPublico),
-    duvidas_total: duvidas.length,
-    duvidas_por_responder: porResponder,
-    bytes_materiais: materiais.reduce(function (s, m) { return s + numero(m['Bytes']); }, 0)
-  });
-};
-
-/* ============================================================
-   6B. ESTUDIO DO FORMADOR
-   ============================================================ */
-
-rotas['POST /become-instructor'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-  if (!utilizador['Token Confirmado']) return erro(res, 'confirme primeiro o seu email');
-
-  if (utilizador['Formador Aprovado']) {
-    return ok(res, { formador: true, ja: true });
-  }
-
-  const gratuito = await planoDoFormador(null);
-
-  await bubbleActualizar(T.user, idDono, {
-    'Papel': 'Formador',
-    'Formador Aprovado': true,
-    'Bio': texto(corpo.bio) || texto(utilizador['Bio']),
-    'Telefone': texto(corpo.telefone) || texto(utilizador['Telefone']),
-    'Plano Formador': gratuito ? gratuito._id : '',
-    'Plano Desde': agora(),
-    'Bytes Usados': numero(utilizador['Bytes Usados'])
-  });
-
-  ok(res, { formador: true, ja: false, plano: planoPublico(gratuito) });
-};
-
-/* ---------- planos do formador ---------- */
-
-rotas['POST /author-plans'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const activos = await planosActivos();
-
-  if (!idDono) {
-    return ok(res, {
-      planos: activos.map(function (p) { return planoPublico(p); }),
-      comissao_pct: COMISSAO_PCT
-    });
-  }
-
-  const c = await consumoDe(idDono);
-
-  ok(res, {
-    planos: activos.map(function (p) {
-      return planoPublico(p, { actual: !!(c.plano && c.plano._id === p._id) });
-    }),
-    meu: planoPublico(c.plano),
-    cursos_usados: c.cursos_usados,
-    cursos_max: c.cursos_max,
-    cursos_ilimitados: c.cursos_ilimitados,
-    bytes_usados: c.bytes_usados,
-    bytes_max: c.bytes_max,
-    bytes_livres: c.bytes_livres,
-    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max),
-    plano_desde: (c.utilizador && c.utilizador['Plano Desde']) || null,
-    comissao_pct: COMISSAO_PCT
-  });
-};
-
-/* Adesao ao plano — pagamento unico, sem mensalidade.
-   Nao ha comissao a repartir: a adesao e toda da plataforma. */
-
-rotas['POST /pay-plan'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idPlano = texto(corpo.plano);
-  const numeroBruto = texto(corpo.numero);
-  let metodo = texto(corpo.metodo).toLowerCase();
-
-  if (!idDono || !idPlano) return erro(res, 'owner ou plano em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-  const plano = await bubblePorId(T.planoFormador, idPlano);
-  if (!plano || !plano['Is Active']) return erro(res, 'plano nao disponivel', 404);
-
-  if (texto(utilizador['Plano Formador']) === idPlano) {
-    return erro(res, 'ja esta neste plano');
-  }
-
-  const valor = numero(plano['Preco MZN']);
-
-  /* O plano gratuito nao passa pela MoPayment. */
-  if (valor <= 0) {
-    await bubbleActualizar(T.user, idDono, {
-      'Plano Formador': idPlano,
-      'Plano Desde': agora()
-    });
-    return ok(res, { pago: true, gratis: true, plano: planoPublico(plano) });
-  }
-
-  /* Descer de plano nao pode deixar o formador acima do limite novo. */
-  const cursos = await cursosVivosDe(idDono);
-  const maxNovo = numero(plano['Max Cursos']);
-  if (maxNovo > 0 && cursos.length > maxNovo) {
-    return erro(res, 'tem ' + cursos.length + ' cursos e este plano so permite ' +
-      maxNovo + '. Apague os que sobram antes de mudar.');
-  }
-
-  const numeroLimpo = normalizarNumero(numeroBruto);
-  if (numeroLimpo.length !== 9) {
-    return erro(res, 'numero invalido — devem ser 9 digitos, por exemplo 841234567');
-  }
-
-  if (!metodo) metodo = operadoraDoNumero(numeroLimpo);
-  if (metodo !== 'mpesa' && metodo !== 'emola') {
-    return erro(res, 'nao reconheci a operadora deste numero — escolha M-Pesa ou e-Mola');
-  }
-
-  const nomeCliente = texto(utilizador['Nome Completo']) || 'Formador CURC';
-  const resultado = await cobrarCarteira(metodo, numeroLimpo, nomeCliente, valor);
-
-  const idPagamento = await bubbleCriar(T.pagamento, {
-    'User': idDono,
-    'Metodo': metodo,
-    'Telefone': numeroLimpo,
-    'Valor MZN': valor,
-    'Item Type': 'plano',
-    'Item Name': texto(plano['Nome']),
-    'Item ID': idPlano,
-    'Estado': resultado.sucesso ? 'Pago' : 'Falhou',
-    'Transaction': resultado.transacao,
-    'Message': resultado.mensagem,
-    'Raw': resultado.bruto,
-    'Comissao MZN': resultado.sucesso ? valor : 0,
-    'Liquido MZN': 0
-  });
-
-  if (!resultado.sucesso) {
-    return responder(res, 200, {
-      ok: false,
-      pago: false,
-      erro: resultado.mensagem,
-      codigo: resultado.codigo,
-      pagamento: idPagamento
-    });
-  }
-
-  await bubbleActualizar(T.user, idDono, {
-    'Plano Formador': idPlano,
-    'Plano Desde': agora()
-  });
-
-  log('Adesao aceite', metodo, valor, 'MZN — plano', texto(plano['Nome']));
-
-  ok(res, {
-    pago: true,
-    valor: valor,
-    transacao: resultado.transacao,
-    pagamento: idPagamento,
-    plano: planoPublico(plano)
-  });
-};
-
-rotas['POST /studio-courses'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const cursos = await bubbleTodos(T.curso, [
-    restricao('Formador', 'equals', idDono)
-  ], { maximo: 500 });
-
-  const vivos = cursos.filter(function (c) { return !c['Is Deleted']; });
-
-  ok(res, {
-    cursos: vivos.map(function (c) {
-      const publico = cursoPublico(c);
-      publico.estado = texto(c['Estado']) || 'Rascunho';
-      publico.tem_intro = !!texto(c['Intro Video ID']);
-      publico.criado = c['Created Date'] || null;
-      return publico;
-    })
-  });
-};
-
-rotas['POST /studio-stats'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  if (!idDono) return erro(res, 'owner em falta');
-
-  const utilizador = await bubblePorId(T.user, idDono);
-  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-  const cursos = (await bubbleTodos(T.curso, [
-    restricao('Formador', 'equals', idDono)
-  ], { maximo: 500 })).filter(function (c) { return !c['Is Deleted']; });
-
-  const inscricoes = await bubbleTodos(T.inscricao, [
-    restricao('Formador', 'equals', idDono)
-  ], { maximo: 2000 });
-
-  const alunosUnicos = new Set(inscricoes.map(function (i) { return texto(i['Aluno']); }));
-
-  const publicados = cursos.filter(function (c) { return texto(c['Estado']) === 'Publicado'; });
-
-  const c = await consumoDe(idDono);
-
-  ok(res, {
-    saldo: numero(utilizador['Saldo MZN']),
-    total_ganho: numero(utilizador['Total Ganho MZN']),
-    cursos_total: cursos.length,
-    cursos_publicados: publicados.length,
-    alunos: alunosUnicos.size,
-    inscricoes: inscricoes.length,
-    comissao_pct: COMISSAO_PCT,
-    plano: planoPublico(c.plano),
-    cursos_max: c.cursos_max,
-    cursos_ilimitados: c.cursos_ilimitados,
-    pode_criar: c.cursos_ilimitados || c.cursos_usados < c.cursos_max,
-    bytes_usados: c.bytes_usados,
-    bytes_max: c.bytes_max,
-    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max)
-  });
-};
-
-rotas['POST /course-save'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-
-  await formadorActivo(idDono);
-
-  /* Ao editar, quem nao vem no pedido fica como estava.
-     Sem isto, gravar so o titulo apagava a descricao. */
-  const anterior = idCurso ? await cursoDoFormador(idDono, idCurso) : {};
-
-  function veio(chave) {
-    return Object.prototype.hasOwnProperty.call(corpo, chave);
-  }
-
-  const titulo = veio('titulo') ? texto(corpo.titulo) : texto(anterior['Titulo']);
-  if (!titulo) return erro(res, 'o curso precisa de um titulo');
-
-  const gratis = veio('gratis') ? corpo.gratis === true : !!anterior['E Gratis'];
-  const preco = gratis ? 0
-    : (veio('preco') ? Math.max(0, Math.round(numero(corpo.preco))) : numero(anterior['Preco MZN']));
-  const promo = gratis ? 0
-    : (veio('preco_promo') ? Math.max(0, Math.round(numero(corpo.preco_promo))) : numero(anterior['Preco Promo MZN']));
-
-  if (!gratis && preco <= 0) {
-    return erro(res, 'defina um preco, ou marque o curso como gratuito');
-  }
-  if (promo > 0 && promo >= preco) {
-    return erro(res, 'o preco promocional tem de ser inferior ao normal');
-  }
-
-  const campos = {
-    'Titulo': titulo,
-    'Preco MZN': preco,
-    'Preco Promo MZN': promo,
-    'E Gratis': gratis
-  };
-
-  if (veio('subtitulo')) campos['Subtitulo'] = texto(corpo.subtitulo).slice(0, 200);
-  if (veio('descricao')) campos['Descricao'] = texto(corpo.descricao);
-  if (veio('categoria')) campos['Categoria'] = texto(corpo.categoria);
-  if (veio('nivel')) campos['Nivel'] = texto(corpo.nivel) || 'Iniciante';
-  if (veio('certificado')) campos['Tem Certificado'] = corpo.certificado === true;
-
-  /* Marca propria da area de membro. */
-  if (veio('cor_marca')) {
-    const cor = texto(corpo.cor_marca);
-    campos['Cor Marca'] = /^#[0-9A-Fa-f]{6}$/.test(cor) ? cor : '';
-  }
-  if (veio('boas_vindas')) campos['Boas Vindas'] = texto(corpo.boas_vindas).slice(0, 1000);
-
-  /* Afiliados. O minimo e obrigatorio: quem liga tem de dar
-     pelo menos AFILIADO_MIN_PCT, senao nao vale a pena a ninguem. */
-  if (veio('aceita_afiliados')) {
-    const liga = corpo.aceita_afiliados === true;
-    campos['Aceita Afiliados'] = liga;
-    if (!liga) campos['Comissao Afiliado Pct'] = 0;
-  }
-  if (veio('comissao_afiliado')) {
-    const pct = Math.round(numero(corpo.comissao_afiliado));
-    const liga = veio('aceita_afiliados')
-      ? corpo.aceita_afiliados === true
-      : !!anterior['Aceita Afiliados'];
-
-    if (liga) {
-      if (pct < AFILIADO_MIN_PCT) {
-        return erro(res, 'a comissao do afiliado nao pode ser menor que ' + AFILIADO_MIN_PCT + '%');
-      }
-      if (pct > AFILIADO_MAX_PCT) {
-        return erro(res, 'a comissao do afiliado nao pode passar dos ' + AFILIADO_MAX_PCT + '%');
-      }
-      campos['Comissao Afiliado Pct'] = pct;
-    }
-  }
-
-  if (Array.isArray(corpo.aprende)) {
-    campos['O Que Vai Aprender'] = corpo.aprende.map(texto).filter(Boolean).slice(0, 12);
-  }
-  if (Array.isArray(corpo.requisitos)) {
-    campos['Requisitos'] = corpo.requisitos.map(texto).filter(Boolean).slice(0, 12);
-  }
-
-  if (idCurso) {
-    await bubbleActualizar(T.curso, idCurso, campos);
-    return ok(res, { curso: idCurso, novo: false });
-  }
-
-  if (!campos['Nivel']) campos['Nivel'] = 'Iniciante';
-
-  /* So aqui, na criacao. Editar um curso que ja existe nunca
-     e travado, mesmo que o formador tenha descido de plano. */
-  const cabe = await podeCriarCurso(idDono);
-  if (!cabe.pode) return erro(res, cabe.motivo);
-
-  campos['Formador'] = idDono;
-  campos['Slug'] = slugificar(titulo) + '-' + codigoAleatorio(4).toLowerCase();
-  campos['Estado'] = 'Rascunho';
-  campos['Total Aulas'] = 0;
-  campos['Total Alunos'] = 0;
-  campos['Duracao Segundos'] = 0;
-  campos['Media Estrelas'] = 0;
-  campos['Total Avaliacoes'] = 0;
-  campos['Is Deleted'] = false;
-  if (!veio('aceita_afiliados')) campos['Aceita Afiliados'] = false;
-  if (!veio('comissao_afiliado')) campos['Comissao Afiliado Pct'] = 0;
-
-  const novo = await bubbleCriar(T.curso, campos);
-  ok(res, { curso: novo, novo: true, slug: campos['Slug'] });
-};
-
-rotas['POST /course-publish'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-
-  const curso = await cursoDoFormador(idDono, idCurso);
-
-  /* Validacoes antes de deixar publicar. */
-  const faltas = [];
-  if (!texto(curso['Titulo'])) faltas.push('titulo');
-  if (!texto(curso['Descricao'])) faltas.push('descricao');
-  if (!texto(curso['Categoria'])) faltas.push('categoria');
-  if (!texto(curso['Capa URL'])) faltas.push('imagem de capa');
-  if (!texto(curso['Intro Video ID'])) faltas.push('video de introducao');
-
-  const contagem = await recontarCurso(idCurso);
-  if (contagem.aulas < 1) faltas.push('pelo menos uma aula');
-
-  if (faltas.length) {
-    return erro(res, 'falta: ' + faltas.join(', '));
-  }
-
-  await bubbleActualizar(T.curso, idCurso, {
-    'Estado': 'Publicado',
-    'Publicado Data': agora()
-  });
-
-  const formador = await bubblePorId(T.user, idDono);
-  const publicados = (await bubbleTodos(T.curso, [
-    restricao('Formador', 'equals', idDono),
-    restricao('Estado', 'equals', 'Publicado')
-  ], { maximo: 500 })).filter(function (c) { return !c['Is Deleted']; });
-
-  if (formador) {
-    await bubbleActualizar(T.user, idDono, { 'Total Cursos': publicados.length });
-  }
-
-  ok(res, { publicado: true, aulas: contagem.aulas, duracao: contagem.duracao });
-};
-
-rotas['POST /course-unpublish'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  await cursoDoFormador(idDono, idCurso);
-
-  await bubbleActualizar(T.curso, idCurso, { 'Estado': 'Rascunho' });
-  ok(res, { publicado: false });
-};
-
-rotas['POST /course-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const curso = await cursoDoFormador(idDono, idCurso);
-
-  if (numero(curso['Total Alunos']) > 0) {
-    return erro(res, 'este curso ja tem alunos inscritos e nao pode ser apagado');
-  }
-
-  /* A capa sai do disco e da conta de espaco. */
-  const caminhoCapa = texto(curso['Capa Path']);
-  const bytesCapa = numero(curso['Capa Bytes']);
-  if (caminhoCapa) await storageApagar(caminhoCapa);
-  if (bytesCapa > 0) {
-    const utilizador = await bubblePorId(T.user, idDono);
-    if (utilizador) {
-      await somarBytes(idDono, numero(utilizador['Bytes Usados']) - bytesCapa);
-    }
-  }
-
-  await bubbleActualizar(T.curso, idCurso, {
-    'Is Deleted': true,
-    'Estado': 'Suspenso',
-    'Capa Path': '',
-    'Capa Bytes': 0
-  });
-
-  ok(res, { apagado: true, libertou: emMB(bytesCapa) });
-};
-
-/* ---------- modulos ---------- */
-
-rotas['POST /module-save'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idModulo = texto(corpo.modulo);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const nome = texto(corpo.nome);
-  if (!nome) return erro(res, 'o modulo precisa de um nome');
-
-  if (idModulo) {
-    const modulo = await bubblePorId(T.modulo, idModulo);
-    if (!modulo || texto(modulo['Curso']) !== idCurso) return erro(res, 'modulo nao encontrado', 404);
-    await bubbleActualizar(T.modulo, idModulo, { 'Nome': nome });
-    return ok(res, { modulo: idModulo, novo: false });
-  }
-
-  const existentes = await bubbleTodos(T.modulo, [
-    restricao('Curso', 'equals', idCurso)
-  ], { maximo: 200 });
-
-  const novo = await bubbleCriar(T.modulo, {
-    'Curso': idCurso,
-    'Nome': nome,
-    'Ordem': existentes.filter(function (m) { return !m['Is Deleted']; }).length + 1,
-    'Is Deleted': false
-  });
-
-  ok(res, { modulo: novo, novo: true });
-};
-
-rotas['POST /module-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idModulo = texto(corpo.modulo);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const aulas = (await bubbleTodos(T.aula, [
-    restricao('Modulo', 'equals', idModulo)
-  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
-
-  if (aulas.length) {
-    return erro(res, 'apague primeiro as ' + aulas.length + ' aulas deste modulo');
-  }
-
-  await bubbleActualizar(T.modulo, idModulo, { 'Is Deleted': true });
-  ok(res, { apagado: true });
-};
-
-/* ---------- aulas ---------- */
-
-rotas['POST /lesson-save'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idAula = texto(corpo.aula);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const titulo = texto(corpo.titulo);
-  if (!titulo) return erro(res, 'a aula precisa de um titulo');
-
-  const tipo = texto(corpo.tipo) || 'Video';
-  if (['Video', 'Texto', 'Ficheiro', 'Live'].indexOf(tipo) === -1) {
-    return erro(res, 'tipo de aula desconhecido');
-  }
-
-  const campos = { 'Titulo': titulo };
-
-  function veioAula(chave) {
-    return Object.prototype.hasOwnProperty.call(corpo, chave);
-  }
-
-  if (veioAula('descricao')) campos['Descricao'] = texto(corpo.descricao);
-  if (veioAula('tipo')) campos['Tipo'] = tipo;
-  if (veioAula('texto')) campos['Texto'] = texto(corpo.texto);
-  if (veioAula('livre')) campos['E Livre'] = corpo.livre === true;
-
-  if (idAula) {
-    const aula = await bubblePorId(T.aula, idAula);
-    if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
-    if (texto(corpo.modulo)) campos['Modulo'] = texto(corpo.modulo);
-    await bubbleActualizar(T.aula, idAula, campos);
-    await recontarCurso(idCurso);
-    return ok(res, { aula: idAula, novo: false });
-  }
-
-  const idModulo = texto(corpo.modulo);
-  if (!idModulo) return erro(res, 'escolha o modulo da aula');
-
-  const irmas = (await bubbleTodos(T.aula, [
-    restricao('Modulo', 'equals', idModulo)
-  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
-
-  campos['Curso'] = idCurso;
-  campos['Modulo'] = idModulo;
-  campos['Tipo'] = tipo;
-  campos['Ordem'] = irmas.length + 1;
-  campos['Duracao Segundos'] = 0;
-  campos['Is Deleted'] = false;
-  if (!veioAula('livre')) campos['E Livre'] = false;
-
-  const novo = await bubbleCriar(T.aula, campos);
-  await recontarCurso(idCurso);
-
-  ok(res, { aula: novo, novo: true });
-};
-
-rotas['POST /lesson-delete'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const idAula = texto(corpo.aula);
-
-  await cursoDoFormador(idDono, idCurso);
-
-  const aula = await bubblePorId(T.aula, idAula);
-  if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
-
-  await streamApagarVideo(texto(aula['Bunny Video ID']));
-  await bubbleActualizar(T.aula, idAula, { 'Is Deleted': true });
-  const contagem = await recontarCurso(idCurso);
-
-  ok(res, { apagado: true, aulas: contagem.aulas });
-};
-
-rotas['POST /reorder'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const alvo = texto(corpo.tipo);
-  const ids = Array.isArray(corpo.ids) ? corpo.ids.map(texto).filter(Boolean) : [];
-
-  await cursoDoFormador(idDono, idCurso);
-
-  if (alvo !== 'modulo' && alvo !== 'aula') return erro(res, 'tipo deve ser modulo ou aula');
-  if (!ids.length) return erro(res, 'lista de ids vazia');
-
-  const tabela = alvo === 'modulo' ? T.modulo : T.aula;
-
-  for (let i = 0; i < ids.length; i++) {
-    const registo = await bubblePorId(tabela, ids[i]);
-    if (!registo || texto(registo['Curso']) !== idCurso) continue;
-    await bubbleActualizar(tabela, ids[i], { 'Ordem': i + 1 });
-  }
-
-  ok(res, { ordenados: ids.length });
-};
-
-/* ---------- video: autorizacao para o TUS ---------- */
-
-rotas['POST /video-token'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const alvo = texto(corpo.alvo) || 'aula';
-
-  await cursoDoFormador(idDono, idCurso);
-
-  if (alvo !== 'aula' && alvo !== 'intro') return erro(res, 'alvo deve ser aula ou intro');
-
-  let idAula = '';
-  if (alvo === 'aula') {
-    idAula = texto(corpo.aula);
-    if (!idAula) return erro(res, 'aula em falta');
-    const aula = await bubblePorId(T.aula, idAula);
-    if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
-    /* Se ja tinha video, apaga o antigo para nao deixar lixo a pagar. */
-    await streamApagarVideo(texto(aula['Bunny Video ID']));
-  } else {
-    const curso = await bubblePorId(T.curso, idCurso);
-    await streamApagarVideo(texto(curso['Intro Video ID']));
-  }
-
-  const titulo = texto(corpo.titulo) || (alvo === 'intro' ? 'Introducao' : 'Aula');
-  const idVideo = await streamCriarVideo(titulo);
-
-  /* Duas horas chega para qualquer envio, mesmo com rede fraca. */
-  const validade = Math.floor(Date.now() / 1000) + 2 * 60 * 60;
-
-  ok(res, {
-    video_id: idVideo,
-    biblioteca: STREAM_LIBRARY,
-    assinatura: streamAssinatura(idVideo, validade),
-    validade: validade,
-    endpoint: 'https://video.bunnycdn.com/tusupload',
-    alvo: alvo,
-    aula: idAula
-  });
-};
-
-rotas['POST /video-done'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-  const alvo = texto(corpo.alvo) || 'aula';
-  const idVideo = texto(corpo.video_id);
-
-  await cursoDoFormador(idDono, idCurso);
-  if (!idVideo) return erro(res, 'video_id em falta');
-
-  const info = await streamEstado(idVideo);
-  const duracao = info ? numero(info.length) : 0;
-
-  if (alvo === 'intro') {
-    await bubbleActualizar(T.curso, idCurso, {
-      'Intro Video ID': idVideo,
-      'Intro Playback URL': urlPlayback(idVideo),
-      'Intro Thumbnail URL': urlMiniatura(idVideo),
-      'Intro Duracao': duracao
-    });
-    return ok(res, { guardado: 'intro', duracao: duracao });
-  }
-
-  const idAula = texto(corpo.aula);
-  const aula = await bubblePorId(T.aula, idAula);
-  if (!aula || texto(aula['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
-
-  await bubbleActualizar(T.aula, idAula, {
-    'Bunny Video ID': idVideo,
-    'Playback URL': urlPlayback(idVideo),
-    'Thumbnail URL': urlMiniatura(idVideo),
-    'Duracao Segundos': duracao,
-    'Estado Video': 'processing',
-    'Tipo': 'Video'
-  });
-
-  await recontarCurso(idCurso);
-  ok(res, { guardado: 'aula', duracao: duracao });
-};
-
-rotas['POST /video-status'] = async function (req, res, corpo) {
-  const idVideo = texto(corpo.video_id);
-  if (!idVideo) return erro(res, 'video_id em falta');
-
-  const info = await streamEstado(idVideo);
-  if (!info) return erro(res, 'video nao encontrado', 404);
-
-  /* Estados do Bunny: 0 em fila, 1 a processar, 2 a codificar,
-     3 terminado, 4 resolucoes prontas, 5 falhou. */
-  const codigo = numero(info.status);
-  const pronto = codigo >= 3 && codigo !== 5;
-
-  /* Assim que ficar pronto, guarda a duracao real na aula. */
-  const idAula = texto(corpo.aula);
-  if (pronto && idAula) {
-    const aula = await bubblePorId(T.aula, idAula);
-    if (aula && texto(aula['Bunny Video ID']) === idVideo) {
-      await bubbleActualizar(T.aula, idAula, {
-        'Estado Video': 'ready',
-        'Duracao Segundos': numero(info.length)
-      });
-      await recontarCurso(texto(aula['Curso']));
-    }
-  }
-
-  ok(res, {
-    estado: codigo,
-    pronto: pronto,
-    falhou: codigo === 5,
-    progresso: numero(info.encodeProgress),
-    duracao: numero(info.length)
-  });
-};
-
-/* ---------- imagens ---------- */
-
-rotas['POST /upload-image'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const alvo = texto(corpo.alvo) || 'capa';
-  const tipoMime = texto(corpo.mime).toLowerCase();
-  const base64 = texto(corpo.dados);
-
-  if (!idDono) return erro(res, 'owner em falta');
-  if (!base64) return erro(res, 'imagem em falta');
-
-  const extensao = IMAGENS_ACEITES[tipoMime];
-  if (!extensao) return erro(res, 'so aceito imagens jpg, png ou webp');
-
-  const bytes = Buffer.from(base64.replace(/^data:[^,]+,/, ''), 'base64');
-  if (!bytes.length) return erro(res, 'imagem vazia');
-  if (bytes.length > 5 * 1024 * 1024) return erro(res, 'imagem acima de 5 MB');
-
-  let caminho;
-
-  if (alvo === 'capa') {
-    const idCurso = texto(corpo.curso);
-    const curso = await cursoDoFormador(idDono, idCurso);
-
-    /* O que la estava sai da conta e do disco. */
-    const caminhoAntigo = texto(curso['Capa Path']);
-    const bytesAntigos = numero(curso['Capa Bytes']);
-
-    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
-    if (!cabe.pode) return erro(res, cabe.motivo);
-
-    caminho = 'capas/' + idCurso + '-' + Date.now() + '.' + extensao;
-    const url = await storageGuardar(caminho, bytes, tipoMime);
-
-    if (caminhoAntigo) await storageApagar(caminhoAntigo);
-
-    await bubbleActualizar(T.curso, idCurso, {
-      'Capa URL': url,
-      'Capa Path': caminho,
-      'Capa Bytes': bytes.length
-    });
-    await somarBytes(idDono, cabe.usados + bytes.length);
-
-    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
-  }
-
-  if (alvo === 'logo') {
-    const idCurso = texto(corpo.curso);
-    const curso = await cursoDoFormador(idDono, idCurso);
-
-    const caminhoAntigo = texto(curso['Logo Path']);
-    const bytesAntigos = numero(curso['Logo Bytes']);
-
-    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
-    if (!cabe.pode) return erro(res, cabe.motivo);
-
-    caminho = 'logos/' + idCurso + '-' + Date.now() + '.' + extensao;
-    const url = await storageGuardar(caminho, bytes, tipoMime);
-
-    if (caminhoAntigo) await storageApagar(caminhoAntigo);
-
-    await bubbleActualizar(T.curso, idCurso, {
-      'Logo URL': url,
-      'Logo Path': caminho,
-      'Logo Bytes': bytes.length
-    });
-    await somarBytes(idDono, cabe.usados + bytes.length);
-
-    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
-  }
-
-  if (alvo === 'perfil') {
-    const utilizador = await bubblePorId(T.user, idDono);
-    if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
-
-    const caminhoAntigo = texto(utilizador['Foto Path']);
-    const bytesAntigos = numero(utilizador['Foto Bytes']);
-
-    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
-    if (!cabe.pode) return erro(res, cabe.motivo);
-
-    caminho = 'perfis/' + idDono + '-' + Date.now() + '.' + extensao;
-    const url = await storageGuardar(caminho, bytes, tipoMime);
-
-    if (caminhoAntigo) await storageApagar(caminhoAntigo);
-
-    await bubbleActualizar(T.user, idDono, {
-      'Foto URL': url,
-      'Foto Path': caminho,
-      'Foto Bytes': bytes.length,
-      'Bytes Usados': Math.max(0, Math.round(cabe.usados + bytes.length))
-    });
-
-    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
-  }
-
-  erro(res, 'alvo deve ser capa, logo ou perfil');
-};
-
-/* ---------- ver o curso como dono, com tudo a descoberto ---------- */
-
-rotas['POST /studio-course'] = async function (req, res, corpo) {
-  const idDono = texto(corpo.owner);
-  const idCurso = texto(corpo.curso);
-
-  const curso = await cursoDoFormador(idDono, idCurso);
-
-  const modulos = (await bubbleTodos(T.modulo, [
-    restricao('Curso', 'equals', idCurso)
-  ], { ordenarPor: 'Ordem', maximo: 200 })).filter(function (m) { return !m['Is Deleted']; });
-
-  const aulas = (await bubbleTodos(T.aula, [
-    restricao('Curso', 'equals', idCurso)
-  ], { ordenarPor: 'Ordem', maximo: 1000 })).filter(function (a) { return !a['Is Deleted']; });
-
-  ok(res, {
-    curso: Object.assign(cursoPublico(curso), {
-      descricao: texto(curso['Descricao']),
-      aprende: curso['O Que Vai Aprender'] || [],
-      requisitos: curso['Requisitos'] || [],
-      estado: texto(curso['Estado']) || 'Rascunho',
-      intro_video_id: texto(curso['Intro Video ID']),
-      cor_marca: texto(curso['Cor Marca']),
-      logo: texto(curso['Logo URL']),
-      boas_vindas: texto(curso['Boas Vindas'])
-    }),
-    modulos: modulos.map(function (m) {
-      return {
-        id: m._id,
-        nome: texto(m['Nome']),
-        ordem: numero(m['Ordem']),
-        aulas: aulas
-          .filter(function (a) { return texto(a['Modulo']) === m._id; })
-          .map(function (a) {
-            return {
-              id: a._id,
-              titulo: texto(a['Titulo']),
-              descricao: texto(a['Descricao']),
-              tipo: texto(a['Tipo']),
-              texto: texto(a['Texto']),
-              ordem: numero(a['Ordem']),
-              livre: !!a['E Livre'],
-              video_id: texto(a['Bunny Video ID']),
-              playback: texto(a['Playback URL']),
-              thumb: texto(a['Thumbnail URL']),
-              duracao: numero(a['Duracao Segundos']),
-              estado_video: texto(a['Estado Video'])
-            };
-          })
-      };
-    })
-  });
-};
-
-/* ============================================================
-   7. SERVIDOR
-   ============================================================ */
-
-const servidor = http.createServer(async function (req, res) {
-  if (req.method === 'OPTIONS') {
-    res.writeHead(204, {
-      'Access-Control-Allow-Origin': '*',
-      'Access-Control-Allow-Headers': 'Content-Type, Authorization',
-      'Access-Control-Allow-Methods': 'GET, POST, OPTIONS',
-      'Access-Control-Max-Age': '86400'
-    });
-    res.end();
+function arrancar(){
+  if (!SESSAO) {
+    aviso('Entre na sua conta para abrir o estúdio', 'mau');
+    setTimeout(function(){
+      window.location.href = CFG.LOGIN + '?volta=' + encodeURIComponent(window.location.href);
+    }, 1300);
     return;
   }
 
-  const caminho = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
-  const chave = req.method + ' ' + caminho;
-  const rota = rotas[chave];
+  $('quem').textContent = CFG.NOME;
 
-  if (!rota) {
-    return erro(res, 'rota desconhecida: ' + chave, 404);
+  api('/account', {}).then(function(c){
+    st.comissao = c.comissao_pct;
+    $('pct-comissao').textContent = c.comissao_pct;
+    $('pct-2').textContent = c.comissao_pct;
+    if (!c.formador_aprovado) return api('/become-instructor', {});
+  }).then(function(){
+    return Promise.all([ carregarCategorias(), carregarLista() ]);
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+  });
+}
+
+function carregarCategorias(){
+  return api('/categories', {}).then(function(d){
+    st.categorias = d.categorias || [];
+    var sel = $('f-categoria');
+    sel.innerHTML = '<option value="">Escolher…</option>' +
+      st.categorias.map(function(c){
+        return '<option value="' + esc(c.id) + '">' + esc(c.nome) + '</option>';
+      }).join('');
+    if (!st.categorias.length) aviso('Não há categorias criadas no Bubble', 'mau');
+  });
+}
+
+function carregarLista(){
+  return Promise.all([ api('/studio-courses', {}), api('/studio-stats', {}) ])
+    .then(function(r){
+      st.cursos = r[0].cursos || [];
+      st.consumo = r[1];
+      desenharFaixa(r[1]);
+      desenharNumeros(r[1]);
+      desenharCursos();
+    });
+}
+
+/* ============================================================
+   FAIXA DO PLANO
+   ============================================================ */
+
+function desenharFaixa(s){
+  var plano = s.plano;
+  if (!plano) {
+    $('faixa-plano').innerHTML = '';
+    return;
   }
 
-  let corpo = {};
-  if (req.method === 'POST') {
-    try {
-      const limite = caminho === '/material-upload' ? 40
-                   : (caminho === '/upload-image' ? 10 : 2);
-      corpo = await lerCorpo(req, limite);
-    } catch (e) {
-      return erro(res, e.message);
+  var usados = s.cursos_total || 0;
+  var maxC = s.cursos_max || 0;
+  var pctC = s.cursos_ilimitados ? 0 : Math.min(100, maxC ? (usados / maxC) * 100 : 0);
+
+  var bytes = s.bytes_usados || 0;
+  var maxB = s.bytes_max || 0;
+  var pctB = maxB ? Math.min(100, (bytes / maxB) * 100) : 0;
+
+  function classe(pct){
+    return pct >= 100 ? 'tubo estourado' : (pct >= 80 ? 'tubo cheio' : 'tubo');
+  }
+
+  $('faixa-plano').innerHTML =
+    '<div class="faixa">' +
+      '<span class="selo-plano">' + esc(plano.nome) + '</span>' +
+
+      '<div class="medida">' +
+        '<b>' + (s.cursos_ilimitados
+          ? usados + (usados === 1 ? ' curso' : ' cursos') + ' · sem limite'
+          : usados + ' de ' + maxC + (maxC === 1 ? ' curso' : ' cursos')) + '</b>' +
+        (s.cursos_ilimitados ? '' : '<div class="' + classe(pctC) + '"><i style="width:' + pctC + '%"></i></div>') +
+      '</div>' +
+
+      '<div class="medida">' +
+        '<b>' + tamanho(bytes) + ' de ' + tamanho(maxB) + '</b>' +
+        '<div class="' + classe(pctB) + '"><i style="width:' + pctB + '%"></i></div>' +
+        '<small>capas e materiais · o vídeo não conta</small>' +
+      '</div>' +
+
+      '<button class="btn" id="b-planos">Ver planos</button>' +
+    '</div>';
+
+  $('b-planos').onclick = abrirPlanos;
+}
+
+function desenharNumeros(s){
+  $('numeros').innerHTML =
+    caixa(s.cursos_publicados + ' de ' + s.cursos_total, 'cursos no ar') +
+    caixa(String(s.alunos), 'alunos') +
+    caixa(mzn(s.saldo), 'saldo', 'ganho') +
+    caixa(mzn(s.total_ganho), 'ganho até hoje');
+
+  function caixa(valor, rotulo, extra){
+    return '<div class="num ' + (extra || '') + '"><b>' + esc(valor) + '</b>' +
+           '<small>' + esc(rotulo) + '</small></div>';
+  }
+}
+
+/* ============================================================
+   LISTA DE CURSOS
+   ============================================================ */
+
+function desenharCursos(){
+  var area = $('area-cursos');
+
+  $('sub-lista').textContent = st.cursos.length
+    ? st.cursos.length + (st.cursos.length === 1 ? ' curso' : ' cursos')
+    : 'Ainda nada por aqui';
+
+  var podeCriar = !st.consumo || st.consumo.pode_criar !== false;
+  $('b-novo').disabled = !podeCriar;
+  $('b-novo').textContent = podeCriar ? 'Criar curso' : 'Limite do plano atingido';
+
+  if (!st.cursos.length) {
+    area.innerHTML =
+      '<div class="vazio">' +
+        '<h2>Comece pelo primeiro curso</h2>' +
+        '<p>Dê-lhe um título e um preço. Pode gravar como rascunho e voltar depois — ' +
+        'só fica visível aos alunos quando publicar.</p>' +
+        '<button class="btn btn-p" id="b-novo2">Criar curso</button>' +
+      '</div>';
+    $('b-novo2').onclick = novoCurso;
+    return;
+  }
+
+  area.innerHTML = '<div class="cursos">' + st.cursos.map(function(c){
+    var selo = (c.estado || 'Rascunho').toLowerCase();
+    var capa = c.capa
+      ? '<div class="capa" style="background-image:url(' + esc(c.capa) + ')"></div>'
+      : '<div class="capa"><em>sem capa</em></div>';
+    return '<article class="curso" data-id="' + esc(c.id) + '">' + capa +
+      '<div class="corpo">' +
+        '<span class="selo ' + esc(selo) + '">' + esc(c.estado) + '</span>' +
+        '<h3>' + esc(c.titulo) + '</h3>' +
+        '<div class="meta">' +
+          '<span>' + (c.gratis ? 'Grátis' : mzn(c.preco_final)) + '</span>' +
+          '<span>' + c.total_aulas + ' aulas</span>' +
+          '<span>' + c.total_alunos + ' alunos</span>' +
+        '</div>' +
+      '</div></article>';
+  }).join('') + '</div>';
+
+  Array.prototype.forEach.call(area.querySelectorAll('.curso'), function(el){
+    el.onclick = function(){ abrirEditor(el.getAttribute('data-id')); };
+  });
+}
+
+/* ============================================================
+   PLANOS
+   ============================================================ */
+
+function abrirPlanos(){
+  $('vista-lista').classList.add('escondido');
+  $('vista-editor').classList.add('escondido');
+  $('vista-planos').classList.remove('escondido');
+  irAoTopo();
+
+  $('area-planos').innerHTML = '<div class="vazio"><p>A carregar os planos…</p></div>';
+
+  api('/author-plans', {}).then(function(d){
+    st.planos = d.planos || [];
+    desenharPlanos(d);
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+    $('area-planos').innerHTML = '<div class="vazio"><h2>Não deu para carregar</h2><p>' + esc(e.message) + '</p></div>';
+  });
+}
+
+function voltarDosPlanos(){
+  $('vista-planos').classList.add('escondido');
+  $('vista-lista').classList.remove('escondido');
+  irAoTopo();
+  carregarLista().catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+function desenharPlanos(d){
+  if (!st.planos.length) {
+    $('area-planos').innerHTML =
+      '<div class="vazio"><h2>Sem planos criados</h2>' +
+      '<p>Ainda não há registos no data type plano_formador do Bubble.</p></div>';
+    return;
+  }
+
+  $('area-planos').innerHTML = '<div class="planos">' + st.planos.map(function(p){
+    var lista = (p.beneficios && p.beneficios.length)
+      ? p.beneficios
+      : [
+          p.ilimitado ? 'Cursos ilimitados' : (p.max_cursos + (p.max_cursos === 1 ? ' curso' : ' cursos')),
+          tamanho(p.bytes) + ' para capas e materiais',
+          'Vídeo sem limite',
+          'Página de venda e área do aluno',
+          'Gestão de alunos e certificados',
+          st.comissao + '% de comissão sobre as vendas'
+        ];
+
+    return '<article class="plano' + (p.actual ? ' actual' : '') + '">' +
+      '<div class="cabeca">' + esc(p.nome) + '</div>' +
+      '<div class="frase">' + esc(p.descricao || '') + '</div>' +
+      '<div class="preco">' + (p.preco > 0 ? mzn(p.preco) : 'Grátis') +
+        '<small>' + (p.preco > 0 ? 'pagamento único de adesão' : 'sem custo de adesão') + '</small></div>' +
+      '<ul>' + lista.map(function(b){
+        return '<li><span class="v">✓</span><span>' + esc(b) + '</span></li>';
+      }).join('') + '</ul>' +
+      (p.actual
+        ? '<div class="agora">O seu plano</div>'
+        : '<button class="btn btn-p btn-largo" data-aderir="' + esc(p.id) + '">' +
+            (p.preco > 0 ? 'Aderir' : 'Passar para este') + '</button>') +
+    '</article>';
+  }).join('') + '</div>';
+
+  Array.prototype.forEach.call($('area-planos').querySelectorAll('[data-aderir]'), function(b){
+    b.onclick = function(){
+      var id = b.getAttribute('data-aderir');
+      var plano = st.planos.filter(function(p){ return p.id === id; })[0];
+      if (plano) comecarAdesao(plano);
+    };
+  });
+}
+
+/* ---------- adesao ---------- */
+
+function comecarAdesao(plano){
+  st.aderir.plano = plano;
+  st.aderir.metodo = '';
+
+  if (plano.preco <= 0) {
+    if (!confirm('Passar para o plano ' + plano.nome + '?')) return;
+    api('/pay-plan', { plano: plano.id }).then(function(){
+      aviso('Plano alterado', 'bom');
+      abrirPlanos();
+    }).catch(function(e){ aviso(e.message, 'mau'); });
+    return;
+  }
+
+  $('cortina').classList.remove('escondido');
+  desenharAdesao();
+}
+
+function fecharCortina(){ $('cortina').classList.add('escondido'); }
+
+function desenharAdesao(){
+  var p = st.aderir.plano;
+
+  $('caixa').innerHTML =
+    '<div class="puxador"></div>' +
+    '<h2>Aderir ao plano ' + esc(p.nome) + '</h2>' +
+    '<p class="ajuda">Pagamento único. Não há mensalidade.</p>' +
+
+    '<div class="metodos">' +
+      '<div class="metodo" data-m="mpesa"><b>M-Pesa</b><small>84 · 85</small></div>' +
+      '<div class="metodo" data-m="emola"><b>e-Mola</b><small>86 · 87</small></div>' +
+    '</div>' +
+
+    '<div class="campo">' +
+      '<label for="a-numero">Número de telemóvel</label>' +
+      '<input type="tel" id="a-numero" placeholder="84 123 4567" maxlength="15" inputmode="numeric" autocomplete="tel">' +
+      '<div class="nota">Nove dígitos. Vai receber um pedido de confirmação no telemóvel.</div>' +
+    '</div>' +
+
+    '<div class="total"><span>Adesão</span><b>' + mzn(p.preco) + '</b></div>' +
+
+    '<button class="btn btn-p btn-largo" id="a-pagar">Pagar agora</button>' +
+    '<button class="btn btn-largo" id="a-fechar" style="margin-top:9px">Cancelar</button>';
+
+  Array.prototype.forEach.call($('caixa').querySelectorAll('.metodo'), function(el){
+    el.onclick = function(){
+      st.aderir.metodo = el.getAttribute('data-m');
+      marcarMetodo(st.aderir.metodo);
+    };
+  });
+
+  $('a-numero').oninput = function(){
+    var so = $('a-numero').value.replace(/\D/g, '');
+    var pref = so.slice(0, 2);
+    var metodo = (pref === '84' || pref === '85') ? 'mpesa'
+               : (pref === '86' || pref === '87') ? 'emola' : '';
+    if (metodo && metodo !== st.aderir.metodo) {
+      st.aderir.metodo = metodo;
+      marcarMetodo(metodo);
     }
+  };
+
+  $('a-pagar').onclick = pagarAdesao;
+  $('a-fechar').onclick = fecharCortina;
+}
+
+function marcarMetodo(metodo){
+  Array.prototype.forEach.call($('caixa').querySelectorAll('.metodo'), function(o){
+    o.classList.toggle('on', o.getAttribute('data-m') === metodo);
+  });
+}
+
+function pagarAdesao(){
+  var numero = $('a-numero').value.replace(/\D/g, '');
+  if (numero.length !== 9) { aviso('O número tem de ter nove dígitos', 'mau'); return; }
+  if (!st.aderir.metodo) { aviso('Escolha M-Pesa ou e-Mola', 'mau'); return; }
+
+  var p = st.aderir.plano;
+
+  $('caixa').innerHTML =
+    '<div class="puxador"></div>' +
+    '<h2>A aguardar confirmação</h2>' +
+    '<p class="ajuda">Confirme o pagamento no seu telemóvel. Não feche esta janela.</p>' +
+    '<div class="espera"><div class="roda"></div>' +
+      '<div style="color:var(--suave);font-size:13.5px">' +
+        esc(st.aderir.metodo === 'emola' ? 'e-Mola' : 'M-Pesa') + ' · ' + esc(numero) +
+      '</div></div>';
+
+  api('/pay-plan', {
+    plano: p.id,
+    metodo: st.aderir.metodo,
+    numero: numero
+  }).then(function(){
+    $('caixa').innerHTML =
+      '<div class="puxador"></div>' +
+      '<h2>Bem-vindo ao ' + esc(p.nome) + '</h2>' +
+      '<p class="ajuda">O plano já está activo. Pode criar mais cursos agora mesmo.</p>' +
+      '<button class="btn btn-p btn-largo" id="a-ok">Continuar</button>';
+
+    $('a-ok').onclick = function(){
+      fecharCortina();
+      voltarDosPlanos();
+    };
+  }).catch(function(e){
+    $('caixa').innerHTML =
+      '<div class="puxador"></div>' +
+      '<h2>O pagamento não passou</h2>' +
+      '<p class="ajuda">' + esc(e.message) + '</p>' +
+      '<button class="btn btn-p btn-largo" id="a-outra">Tentar outra vez</button>' +
+      '<button class="btn btn-largo" id="a-sair" style="margin-top:9px">Fechar</button>';
+
+    $('a-outra').onclick = desenharAdesao;
+    $('a-sair').onclick = fecharCortina;
+  });
+}
+
+/* ============================================================
+   CRIAR E ABRIR
+   ============================================================ */
+
+function novoCurso(){
+  if (st.consumo && st.consumo.pode_criar === false) {
+    aviso('O plano ' + (st.consumo.plano ? st.consumo.plano.nome : 'actual') +
+      ' já não permite mais cursos', 'mau');
+    abrirPlanos();
+    return;
   }
 
-  try {
-    await rota(req, res, corpo);
-  } catch (e) {
-    log('ERRO em', chave, '—', e.message);
-    if (!res.headersSent) erro(res, e.message, 500);
+  var titulo = prompt('Que nome dá ao curso?');
+  if (!titulo || !titulo.trim()) return;
+
+  api('/course-save', { titulo: titulo.trim(), gratis: true })
+    .then(function(d){
+      aviso('Curso criado como rascunho', 'bom');
+      return abrirEditor(d.curso);
+    })
+    .catch(function(e){
+      aviso(e.message, 'mau');
+      /* Se foi o limite do plano a travar, leva-o directamente lá. */
+      if (/plano/i.test(e.message)) setTimeout(abrirPlanos, 900);
+    });
+}
+
+function abrirEditor(id){
+  return api('/studio-course', { curso: id }).then(function(d){
+    st.curso = d.curso;
+    st.modulos = d.modulos || [];
+    $('vista-lista').classList.add('escondido');
+    $('vista-planos').classList.add('escondido');
+    $('vista-editor').classList.remove('escondido');
+    irAoTopo();
+    trocarAba('detalhes');
+    preencherFormulario();
+    desenharModulos();
+    desenharCheck();
+  }).catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+function voltarLista(){
+  pararSondas();
+  st.curso = null;
+  $('vista-editor').classList.add('escondido');
+  $('vista-planos').classList.add('escondido');
+  $('vista-lista').classList.remove('escondido');
+  irAoTopo();
+  carregarLista().catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+function trocarAba(nome){
+  st.aba = nome;
+  Array.prototype.forEach.call(document.querySelectorAll('.aba'), function(b){
+    b.classList.toggle('on', b.getAttribute('data-aba') === nome);
+  });
+  ['detalhes','conteudo','marca','afiliados'].forEach(function(v){
+    $('painel-' + v).classList.toggle('escondido', v !== nome);
+  });
+
+  if (nome === 'marca') desenharMarca();
+  if (nome === 'afiliados') carregarAfiliados();
+}
+
+/* ============================================================
+   MARCA DO CURSO
+   ============================================================ */
+
+/* A cor e o logotipo mandam na area de membro. E o que faz o
+   curso parecer do formador e nao da plataforma. */
+
+function desenharMarca(){
+  var c = st.curso;
+  var cor = /^#[0-9A-Fa-f]{6}$/.test(c.cor_marca || '') ? c.cor_marca : '#A855F7';
+
+  $('painel-marca').innerHTML =
+    '<div class="bloco">' +
+      '<h2>A sua cor</h2>' +
+      '<p class="ajuda">Pinta os botões, as barras e os destaques da área de membro. ' +
+        'Deixe como está para usar a cor do CURC.</p>' +
+      '<div class="duas">' +
+        '<div class="campo">' +
+          '<label for="m-cor">Cor da marca</label>' +
+          '<input type="color" id="m-cor" value="' + esc(cor) + '" ' +
+            'style="height:48px;padding:5px;cursor:pointer">' +
+        '</div>' +
+        '<div class="campo">' +
+          '<label for="m-cor-texto">Ou escreva o código</label>' +
+          '<input type="text" id="m-cor-texto" maxlength="7" placeholder="#A855F7" ' +
+            'value="' + esc(cor) + '">' +
+          '<div class="nota">Seis dígitos depois do cardinal.</div>' +
+        '</div>' +
+      '</div>' +
+      '<div id="m-amostra" style="border-radius:12px;padding:18px;background:' + esc(cor) +
+        ';color:#fff;font-family:Sora;font-weight:600;text-align:center">' +
+        'É assim que os botões vão ficar' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="bloco">' +
+      '<h2>Logotipo</h2>' +
+      '<p class="ajuda">Aparece no topo da área de membro, no lugar da marca CURC. ' +
+        'PNG com fundo transparente fica melhor.</p>' +
+      '<div class="alvo">' +
+        '<div id="m-pre-logo">' +
+          (c.logo ? '<img src="' + esc(c.logo) + '" alt="Logotipo" ' +
+            'style="aspect-ratio:auto;max-height:80px;width:auto;margin:0 auto 12px">' : '') +
+        '</div>' +
+        '<h3>Imagem do logotipo</h3>' +
+        '<p>PNG, JPG ou WebP até 5 MB</p>' +
+        '<button class="btn btn-mini" id="m-b-logo">' +
+          (c.logo ? 'Trocar logotipo' : 'Escolher logotipo') + '</button>' +
+        '<input type="file" id="m-in-logo" accept="image/jpeg,image/png,image/webp" class="escondido">' +
+      '</div>' +
+    '</div>' +
+
+    '<div class="bloco">' +
+      '<h2>Boas-vindas</h2>' +
+      '<p class="ajuda">A primeira coisa que o aluno lê ao entrar na área do curso. ' +
+        'Diga-lhe por onde começar.</p>' +
+      '<div class="campo">' +
+        '<textarea id="m-boas" maxlength="1000" ' +
+          'placeholder="Bem-vindo. Comece pelo módulo 1 e não salte os exercícios.">' +
+          esc(c.boas_vindas || '') + '</textarea>' +
+      '</div>' +
+    '</div>' +
+
+    '<div style="display:flex;gap:9px;flex-wrap:wrap">' +
+      '<button class="btn btn-p" id="m-guardar">Guardar marca</button>' +
+      '<button class="btn" id="m-ver">Ver a área de membro</button>' +
+    '</div>';
+
+  ligarMarca();
+}
+
+function ligarMarca(){
+  var campoCor = $('m-cor');
+  var campoTexto = $('m-cor-texto');
+
+  function pintar(valor){
+    if (!/^#[0-9A-Fa-f]{6}$/.test(valor)) return;
+    $('m-amostra').style.background = valor;
+    campoCor.value = valor;
+    campoTexto.value = valor;
   }
+
+  campoCor.oninput = function(){ pintar(campoCor.value); };
+  campoTexto.oninput = function(){ pintar(campoTexto.value.trim()); };
+
+  $('m-b-logo').onclick = function(){ $('m-in-logo').click(); };
+  $('m-in-logo').onchange = function(){ enviarLogo($('m-in-logo').files[0]); };
+
+  $('m-guardar').onclick = guardarMarca;
+  $('m-ver').onclick = function(){
+    window.open(CFG.ESPACO + '?c=' + encodeURIComponent(st.curso.id), '_blank');
+  };
+}
+
+function guardarMarca(){
+  var cor = $('m-cor-texto').value.trim();
+  if (cor && !/^#[0-9A-Fa-f]{6}$/.test(cor)) {
+    aviso('A cor tem de ser um código de seis dígitos, como #A855F7', 'mau');
+    return;
+  }
+
+  var b = $('m-guardar');
+  b.disabled = true;
+  b.textContent = 'A guardar…';
+
+  api('/course-save', {
+    curso: st.curso.id,
+    cor_marca: cor,
+    boas_vindas: $('m-boas').value.trim()
+  }).then(function(){
+    aviso('Marca actualizada', 'bom');
+    return abrirEditor(st.curso.id);
+  }).then(function(){
+    trocarAba('marca');
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+    b.disabled = false;
+    b.textContent = 'Guardar marca';
+  });
+}
+
+function enviarLogo(ficheiro){
+  if (!ficheiro) return;
+  if (ficheiro.size > 5 * 1024 * 1024) { aviso('A imagem passa dos 5 MB', 'mau'); return; }
+
+  var b = $('m-b-logo');
+  b.disabled = true;
+  b.textContent = 'A enviar…';
+
+  var leitor = new FileReader();
+  leitor.onload = function(){
+    api('/upload-image', {
+      alvo: 'logo',
+      curso: st.curso.id,
+      mime: ficheiro.type,
+      dados: String(leitor.result).split(',')[1]
+    }).then(function(){
+      aviso('Logotipo actualizado', 'bom');
+      return abrirEditor(st.curso.id);
+    }).then(function(){
+      trocarAba('marca');
+    }).catch(function(e){
+      aviso(e.message, 'mau');
+      b.disabled = false;
+      b.textContent = 'Escolher logotipo';
+      if (/espaco|plano/i.test(e.message)) setTimeout(abrirPlanos, 1100);
+    });
+  };
+  leitor.readAsDataURL(ficheiro);
+}
+
+/* ============================================================
+   AFILIADOS DO CURSO
+   ============================================================ */
+
+function carregarAfiliados(){
+  $('painel-afiliados').innerHTML =
+    '<div class="bloco"><p class="ajuda" style="margin:0">A carregar…</p></div>';
+
+  api('/course-affiliates', { curso: st.curso.id })
+    .then(desenharAfiliados)
+    .catch(function(e){
+      $('painel-afiliados').innerHTML =
+        '<div class="vazio"><h2>Não deu para carregar</h2><p>' + esc(e.message) + '</p></div>';
+    });
+}
+
+function desenharAfiliados(d){
+  st.afiliados = d;
+
+  var pct = d.comissao_pct || d.min_pct;
+  var preco = st.curso.gratis ? 0 : st.curso.preco_final;
+
+  var conta = preco > 0
+    ? '<div class="nota" id="af-conta"></div>'
+    : '<div class="nota">Este curso é gratuito. Os afiliados só fazem sentido em cursos pagos.</div>';
+
+  var topo =
+    '<div class="bloco">' +
+      '<h2>Deixar outros venderem por si</h2>' +
+      '<p class="ajuda">Quem partilhar o link recebe uma percentagem de cada venda que trouxer. ' +
+        'Essa percentagem sai da sua parte, não da comissão da plataforma.</p>' +
+
+      '<div class="campo">' +
+        '<label class="troca">' +
+          '<input type="checkbox" id="af-ligar"' + (d.aceita ? ' checked' : '') + '>' +
+          '<span>Aceitar afiliados neste curso</span>' +
+        '</label>' +
+      '</div>' +
+
+      '<div id="af-caixa" class="' + (d.aceita ? '' : 'escondido') + '">' +
+        '<div class="campo">' +
+          '<label for="af-pct">Quanto dá ao afiliado</label>' +
+          '<input type="number" id="af-pct" min="' + d.min_pct + '" max="' + d.max_pct + '" ' +
+            'step="1" value="' + pct + '">' +
+          '<div class="nota">Entre ' + d.min_pct + '% e ' + d.max_pct + '%. ' +
+            'Abaixo de ' + d.min_pct + '% ninguém se dá ao trabalho.</div>' +
+        '</div>' +
+        conta +
+      '</div>' +
+
+      '<button class="btn btn-p" id="af-guardar" style="margin-top:6px">Guardar</button>' +
+    '</div>';
+
+  var numeros =
+    '<div class="numeros" style="grid-template-columns:repeat(3,1fr)">' +
+      '<div class="num"><b>' + d.afiliados.length + '</b><small>a promover</small></div>' +
+      '<div class="num"><b>' + d.cliques + '</b><small>cliques</small></div>' +
+      '<div class="num ganho"><b>' + d.vendas + '</b><small>' +
+        (d.vendas === 1 ? 'venda trazida' : 'vendas trazidas') + '</small></div>' +
+    '</div>';
+
+  var lista = d.afiliados.length
+    ? '<div class="bloco">' +
+        '<h2>Quem está a promover</h2>' +
+        '<p class="ajuda">Já pagou ' + mzn(d.pago) + ' em comissões de afiliado.</p>' +
+        d.afiliados.map(function(a){
+          return '<div class="material" style="margin-bottom:9px">' +
+            '<div class="icone">' + esc((a.nome || '?').charAt(0).toUpperCase()) + '</div>' +
+            '<div class="info">' +
+              '<b>' + esc(a.nome) + '</b>' +
+              '<small>' + a.cliques + ' cliques · ' + a.vendas +
+                (a.vendas === 1 ? ' venda' : ' vendas') + ' · ' + mzn(a.ganho) + '</small>' +
+            '</div>' +
+          '</div>';
+        }).join('') +
+      '</div>'
+    : '<div class="vazio"><h2>Ainda ninguém promove este curso</h2>' +
+      '<p>' + (d.aceita
+        ? 'Partilhe o curso com quem tenha público. Qualquer pessoa com conta pode gerar o link dela.'
+        : 'Ligue os afiliados aqui em cima para que possam gerar os links.') + '</p></div>';
+
+  $('painel-afiliados').innerHTML = topo + (d.afiliados.length ? numeros : '') + lista;
+
+  ligarAfiliados(d, preco);
+}
+
+function ligarAfiliados(d, preco){
+  var ligar = $('af-ligar');
+  var campo = $('af-pct');
+
+  function contas(){
+    var caixa = $('af-conta');
+    if (!caixa || !preco) return;
+
+    var p = Number(campo.value) || 0;
+    var plataforma = Math.round(preco * (st.comissao / 100));
+    var afiliado = Math.round(preco * (p / 100));
+    var meu = preco - plataforma - afiliado;
+
+    caixa.innerHTML =
+      'Numa venda de ' + esc(mzn(preco)) + ': a plataforma leva ' + esc(mzn(plataforma)) +
+      ', o afiliado leva ' + esc(mzn(afiliado)) +
+      ', e <b style="color:var(--tinta)">fica para si ' + esc(mzn(meu)) + '</b>.' +
+      (meu < 0 ? ' <b style="color:var(--vermelho)">Assim sai a perder.</b>' : '');
+  }
+
+  ligar.onchange = function(){
+    $('af-caixa').classList.toggle('escondido', !ligar.checked);
+    contas();
+  };
+  campo.oninput = contas;
+  contas();
+
+  $('af-guardar').onclick = function(){
+    var b = $('af-guardar');
+    var liga = ligar.checked;
+    var p = Math.round(Number(campo.value) || 0);
+
+    if (liga && (p < d.min_pct || p > d.max_pct)) {
+      aviso('A comissão tem de ficar entre ' + d.min_pct + '% e ' + d.max_pct + '%', 'mau');
+      return;
+    }
+
+    b.disabled = true;
+    b.textContent = 'A guardar…';
+
+    api('/course-save', {
+      curso: st.curso.id,
+      aceita_afiliados: liga,
+      comissao_afiliado: p
+    }).then(function(){
+      aviso(liga ? 'Afiliados ligados a ' + p + '%' : 'Afiliados desligados', 'bom');
+      return abrirEditor(st.curso.id);
+    }).then(function(){
+      trocarAba('afiliados');
+    }).catch(function(e){
+      aviso(e.message, 'mau');
+      b.disabled = false;
+      b.textContent = 'Guardar';
+    });
+  };
+}
+
+/* ============================================================
+   DETALHES
+   ============================================================ */
+
+function preencherFormulario(){
+  var c = st.curso;
+  $('titulo-editor').textContent = c.titulo;
+  $('sub-editor').textContent = c.estado === 'Publicado'
+    ? 'No ar · ' + c.total_alunos + ' alunos'
+    : 'Rascunho, ainda não visível';
+
+  $('f-titulo').value = c.titulo || '';
+  $('f-subtitulo').value = c.subtitulo || '';
+  $('f-descricao').value = c.descricao || '';
+  $('f-categoria').value = c.categoria || '';
+  $('f-nivel').value = c.nivel || 'Iniciante';
+  $('f-gratis').checked = !!c.gratis;
+  $('f-preco').value = c.preco || '';
+  $('f-promo').value = c.preco_promo || '';
+  $('f-aprende').value = (c.aprende || []).join('\n');
+  $('f-requisitos').value = (c.requisitos || []).join('\n');
+  $('f-certificado').checked = !!c.certificado;
+
+  $('b-despublicar').classList.toggle('escondido', c.estado !== 'Publicado');
+  $('b-publicar').textContent = c.estado === 'Publicado' ? 'Guardar e republicar' : 'Publicar curso';
+
+  alternarPrecos();
+  desenharCapa();
+  desenharIntro();
+}
+
+function alternarPrecos(){
+  var gratis = $('f-gratis').checked;
+  $('caixa-precos').style.display = gratis ? 'none' : '';
+  if (gratis) { $('nota-ganho').textContent = ''; return; }
+
+  var preco = Number($('f-promo').value) > 0 ? Number($('f-promo').value) : Number($('f-preco').value);
+  $('nota-ganho').innerHTML = preco > 0
+    ? '<div class="nota">Em cada venda recebe ' +
+      esc(mzn(preco * (100 - st.comissao) / 100)) + '.</div>'
+    : '';
+}
+
+function guardarDetalhes(){
+  var b = $('b-guardar');
+  b.disabled = true;
+  b.textContent = 'A guardar…';
+
+  api('/course-save', {
+    curso: st.curso.id,
+    titulo: $('f-titulo').value.trim(),
+    subtitulo: $('f-subtitulo').value.trim(),
+    descricao: $('f-descricao').value.trim(),
+    categoria: $('f-categoria').value,
+    nivel: $('f-nivel').value,
+    gratis: $('f-gratis').checked,
+    preco: Number($('f-preco').value) || 0,
+    preco_promo: Number($('f-promo').value) || 0,
+    aprende: linhas($('f-aprende').value),
+    requisitos: linhas($('f-requisitos').value),
+    certificado: $('f-certificado').checked
+  }).then(function(){
+    aviso('Guardado', 'bom');
+    return abrirEditor(st.curso.id);
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+  }).finally(function(){
+    b.disabled = false;
+    b.textContent = 'Guardar alterações';
+  });
+}
+
+/* ============================================================
+   CAPA
+   ============================================================ */
+
+function desenharCapa(){
+  $('pre-capa').innerHTML = st.curso.capa
+    ? '<img src="' + esc(st.curso.capa) + '" alt="Capa do curso">'
+    : '';
+  $('b-capa').textContent = st.curso.capa ? 'Trocar imagem' : 'Escolher imagem';
+
+  if (st.consumo && st.consumo.bytes_max) {
+    var livre = Math.max(0, st.consumo.bytes_max - st.consumo.bytes_usados);
+    $('txt-capa').textContent = 'JPG, PNG ou WebP · ' + tamanho(livre) + ' livres no plano';
+  }
+}
+
+function enviarCapa(ficheiro){
+  if (!ficheiro) return;
+  if (ficheiro.size > 5 * 1024 * 1024) {
+    aviso('A imagem passa dos 5 MB', 'mau');
+    return;
+  }
+
+  var leitor = new FileReader();
+  leitor.onload = function(){
+    $('b-capa').disabled = true;
+    $('b-capa').textContent = 'A enviar…';
+
+    api('/upload-image', {
+      alvo: 'capa',
+      curso: st.curso.id,
+      mime: ficheiro.type,
+      dados: String(leitor.result).split(',')[1]
+    }).then(function(d){
+      st.curso.capa = d.url;
+      if (st.consumo) st.consumo.bytes_usados = d.bytes_usados;
+      desenharCapa();
+      desenharCheck();
+      aviso('Capa actualizada', 'bom');
+    }).catch(function(e){
+      aviso(e.message, 'mau');
+      if (/espaco|plano/i.test(e.message)) setTimeout(abrirPlanos, 1100);
+    }).finally(function(){
+      $('b-capa').disabled = false;
+      desenharCapa();
+    });
+  };
+  leitor.readAsDataURL(ficheiro);
+}
+
+/* ============================================================
+   VIDEO — envio directo para a Bunny por TUS
+   ============================================================ */
+
+function desenharIntro(){
+  var c = st.curso;
+  $('pre-intro').innerHTML = c.intro_thumb
+    ? '<img src="' + esc(c.intro_thumb) + '" alt="Vídeo de introdução">'
+    : '';
+  $('txt-intro').textContent = c.intro_video_id
+    ? 'Enviado · ' + duracao(c.intro_duracao)
+    : 'MP4 ou MOV · sem limite de tamanho';
+  $('b-intro').textContent = c.intro_video_id ? 'Trocar vídeo' : 'Escolher vídeo';
+}
+
+function arcoHTML(pct){
+  var raio = 33, volta = 2 * Math.PI * raio;
+  var falta = volta * (1 - pct / 100);
+  return '<div class="arco"><svg width="78" height="78" viewBox="0 0 78 78">' +
+    '<circle class="fundo" cx="39" cy="39" r="' + raio + '"></circle>' +
+    '<circle class="frente" cx="39" cy="39" r="' + raio +
+      '" stroke-dasharray="' + volta.toFixed(1) + '" stroke-dashoffset="' + falta.toFixed(1) + '"></circle>' +
+    '</svg><b>' + Math.round(pct) + '%</b></div>';
+}
+
+function enviarVideo(ficheiro, alvo, idAula, aoProgresso, aoFim){
+  if (!ficheiro) return;
+  if (typeof tus === 'undefined') {
+    aviso('A biblioteca de envio não carregou. Recarregue a página.', 'mau');
+    aoFim(false);
+    return;
+  }
+
+  api('/video-token', {
+    curso: st.curso.id,
+    alvo: alvo,
+    aula: idAula || '',
+    titulo: ficheiro.name
+  }).then(function(t){
+    var envio = new tus.Upload(ficheiro, {
+      endpoint: t.endpoint,
+      retryDelays: [0, 3000, 6000, 12000, 30000, 60000],
+      headers: {
+        AuthorizationSignature: t.assinatura,
+        AuthorizationExpire: String(t.validade),
+        VideoId: t.video_id,
+        LibraryId: String(t.biblioteca)
+      },
+      metadata: { filetype: ficheiro.type, title: ficheiro.name },
+      onProgress: function(feitos, total){
+        aoProgresso(total ? (feitos / total) * 100 : 0);
+      },
+      onError: function(erro){
+        aviso('O envio falhou: ' + erro.message, 'mau');
+        aoFim(false);
+      },
+      onSuccess: function(){
+        api('/video-done', {
+          curso: st.curso.id,
+          alvo: alvo,
+          aula: idAula || '',
+          video_id: t.video_id
+        }).then(function(){
+          aviso('Vídeo enviado. A Bunny está a processar.', 'bom');
+          aoFim(true, t.video_id);
+          sondarVideo(t.video_id, idAula);
+        }).catch(function(e){
+          aviso(e.message, 'mau');
+          aoFim(false);
+        });
+      }
+    });
+    envio.start();
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+    aoFim(false);
+  });
+}
+
+function sondarVideo(idVideo, idAula){
+  var tentativas = 0;
+  var relogio = setInterval(function(){
+    tentativas++;
+    if (tentativas > 100) { clearInterval(relogio); return; }
+
+    fetch(CFG.API + '/video-status', {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ video_id: idVideo, aula: idAula || '' })
+    }).then(function(r){ return r.json(); }).then(function(d){
+      if (!d.ok) return;
+      if (d.falhou) {
+        clearInterval(relogio);
+        delete st.sondas[idVideo];
+        aviso('A Bunny não conseguiu processar este vídeo', 'mau');
+        return;
+      }
+      if (d.pronto) {
+        clearInterval(relogio);
+        delete st.sondas[idVideo];
+        if (st.curso) abrirEditor(st.curso.id).then(function(){
+          if (idAula) trocarAba('conteudo');
+        });
+      }
+    }).catch(function(){});
+  }, 6000);
+
+  st.sondas[idVideo] = relogio;
+}
+
+function pararSondas(){
+  Object.keys(st.sondas).forEach(function(k){ clearInterval(st.sondas[k]); });
+  st.sondas = {};
+}
+
+/* ============================================================
+   MODULOS E AULAS
+   ============================================================ */
+
+function desenharModulos(){
+  var area = $('area-modulos');
+
+  if (!st.modulos.length) {
+    area.innerHTML =
+      '<div class="vazio">' +
+        '<h2>Sem módulos</h2>' +
+        '<p>Um módulo é um capítulo do curso. Crie o primeiro e vá juntando aulas.</p>' +
+      '</div>';
+    return;
+  }
+
+  area.innerHTML = st.modulos.map(function(m){
+    var aulas = m.aulas.length
+      ? m.aulas.map(function(a, i){ return htmlAula(a, i + 1); }).join('')
+      : '<div class="sem-aulas">Este módulo ainda não tem aulas.</div>';
+
+    return '<section class="modulo" data-mod="' + esc(m.id) + '">' +
+      '<div class="modulo-topo">' +
+        '<input type="text" value="' + esc(m.nome) + '" data-nome="' + esc(m.id) + '" aria-label="Nome do módulo">' +
+        '<div class="modulo-acoes">' +
+          '<button class="btn btn-mini" data-nova="' + esc(m.id) + '">Nova aula</button>' +
+          '<button class="btn btn-mini btn-perigo" data-apagar-mod="' + esc(m.id) + '">Apagar</button>' +
+        '</div>' +
+      '</div>' + aulas +
+    '</section>';
+  }).join('');
+
+  ligarModulos();
+}
+
+function htmlAula(a, ordem){
+  var ponto = a.video_id
+    ? (a.estado_video === 'ready'
+        ? '<span class="ponto ok"></span>Vídeo pronto · ' + duracao(a.duracao)
+        : '<span class="ponto espera"></span>A processar na Bunny')
+    : '<span class="ponto"></span>Sem vídeo';
+
+  return '<div class="aula" data-aula="' + esc(a.id) + '">' +
+    '<div class="aula-topo">' +
+      '<span class="ordem">' + ordem + '</span>' +
+      '<input type="text" value="' + esc(a.titulo) + '" data-tit="' + esc(a.id) + '" aria-label="Título da aula">' +
+      '<button class="btn btn-mini" data-video="' + esc(a.id) + '">' +
+        (a.video_id ? 'Trocar vídeo' : 'Enviar vídeo') + '</button>' +
+      '<button class="btn btn-mini btn-perigo" data-apagar-aula="' + esc(a.id) + '">Apagar</button>' +
+    '</div>' +
+    '<div class="aula-baixo">' +
+      '<label class="troca"><input type="checkbox" data-livre="' + esc(a.id) + '"' +
+        (a.livre ? ' checked' : '') + '><span>Aula livre</span></label>' +
+      '<span class="estado-video" data-estado="' + esc(a.id) + '">' + ponto + '</span>' +
+      '<span class="barra escondido" data-barra="' + esc(a.id) + '"><i></i></span>' +
+    '</div>' +
+  '</div>';
+}
+
+function ligarModulos(){
+  var area = $('area-modulos');
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-nome]'), function(inp){
+    inp.onchange = function(){
+      api('/module-save', {
+        curso: st.curso.id,
+        modulo: inp.getAttribute('data-nome'),
+        nome: inp.value.trim()
+      }).then(function(){ aviso('Módulo renomeado', 'bom'); })
+        .catch(function(e){ aviso(e.message, 'mau'); });
+    };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-nova]'), function(b){
+    b.onclick = function(){ novaAula(b.getAttribute('data-nova')); };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-apagar-mod]'), function(b){
+    b.onclick = function(){
+      if (!confirm('Apagar este módulo?')) return;
+      api('/module-delete', { curso: st.curso.id, modulo: b.getAttribute('data-apagar-mod') })
+        .then(function(){ return abrirEditor(st.curso.id); })
+        .then(function(){ trocarAba('conteudo'); aviso('Módulo apagado', 'bom'); })
+        .catch(function(e){ aviso(e.message, 'mau'); });
+    };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-tit]'), function(inp){
+    inp.onchange = function(){
+      api('/lesson-save', {
+        curso: st.curso.id,
+        aula: inp.getAttribute('data-tit'),
+        titulo: inp.value.trim()
+      }).then(function(){ aviso('Aula gravada', 'bom'); })
+        .catch(function(e){ aviso(e.message, 'mau'); });
+    };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-livre]'), function(cx){
+    cx.onchange = function(){
+      api('/lesson-save', {
+        curso: st.curso.id,
+        aula: cx.getAttribute('data-livre'),
+        livre: cx.checked
+      }).then(function(){
+        aviso(cx.checked ? 'Aula aberta a todos' : 'Aula só para inscritos', 'bom');
+      }).catch(function(e){
+        aviso(e.message, 'mau');
+        cx.checked = !cx.checked;
+      });
+    };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-apagar-aula]'), function(b){
+    b.onclick = function(){
+      if (!confirm('Apagar esta aula? O vídeo também é apagado.')) return;
+      api('/lesson-delete', { curso: st.curso.id, aula: b.getAttribute('data-apagar-aula') })
+        .then(function(){ return abrirEditor(st.curso.id); })
+        .then(function(){ trocarAba('conteudo'); aviso('Aula apagada', 'bom'); })
+        .catch(function(e){ aviso(e.message, 'mau'); });
+    };
+  });
+
+  Array.prototype.forEach.call(area.querySelectorAll('[data-video]'), function(b){
+    b.onclick = function(){
+      var id = b.getAttribute('data-video');
+      var escolha = document.createElement('input');
+      escolha.type = 'file';
+      escolha.accept = 'video/*';
+      escolha.onchange = function(){
+        var f = escolha.files[0];
+        if (!f) return;
+
+        var barra = area.querySelector('[data-barra="' + id + '"]');
+        var estado = area.querySelector('[data-estado="' + id + '"]');
+        barra.classList.remove('escondido');
+        b.disabled = true;
+
+        enviarVideo(f, 'aula', id, function(pct){
+          barra.querySelector('i').style.width = pct.toFixed(1) + '%';
+          estado.innerHTML = '<span class="ponto espera"></span>A enviar ' + Math.round(pct) + '%';
+        }, function(bom){
+          b.disabled = false;
+          barra.classList.add('escondido');
+          if (bom) estado.innerHTML = '<span class="ponto espera"></span>A processar na Bunny';
+        });
+      };
+      escolha.click();
+    };
+  });
+}
+
+function novoModulo(){
+  var nome = prompt('Nome do módulo');
+  if (!nome || !nome.trim()) return;
+
+  api('/module-save', { curso: st.curso.id, nome: nome.trim() })
+    .then(function(){ return abrirEditor(st.curso.id); })
+    .then(function(){ trocarAba('conteudo'); aviso('Módulo criado', 'bom'); })
+    .catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+function novaAula(idModulo){
+  var titulo = prompt('Título da aula');
+  if (!titulo || !titulo.trim()) return;
+
+  api('/lesson-save', {
+    curso: st.curso.id,
+    modulo: idModulo,
+    titulo: titulo.trim(),
+    tipo: 'Video'
+  }).then(function(){ return abrirEditor(st.curso.id); })
+    .then(function(){ trocarAba('conteudo'); aviso('Aula criada', 'bom'); })
+    .catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+/* ============================================================
+   PUBLICACAO
+   ============================================================ */
+
+function desenharCheck(){
+  var c = st.curso;
+  var totalAulas = st.modulos.reduce(function(s, m){ return s + m.aulas.length; }, 0);
+
+  var itens = [
+    ['Título', !!c.titulo],
+    ['Descrição', !!c.descricao],
+    ['Categoria', !!c.categoria],
+    ['Imagem de capa', !!c.capa],
+    ['Vídeo de introdução', !!c.intro_video_id],
+    ['Pelo menos uma aula', totalAulas > 0]
+  ];
+
+  var feitos = itens.filter(function(i){ return i[1]; }).length;
+
+  $('resumo-check').textContent = feitos === itens.length
+    ? (c.estado === 'Publicado' ? 'Está tudo no sítio.' : 'Está pronto a publicar.')
+    : feitos + ' de ' + itens.length + ' condições cumpridas.';
+
+  $('check').innerHTML = itens.map(function(i){
+    return '<li class="' + (i[1] ? 'feito' : '') + '">' +
+      '<span class="marca-c">' + (i[1] ? '✓' : '') + '</span>' + esc(i[0]) + '</li>';
+  }).join('');
+
+  $('b-publicar').disabled = feitos !== itens.length;
+}
+
+function publicar(){
+  var b = $('b-publicar');
+  b.disabled = true;
+  b.textContent = 'A publicar…';
+
+  api('/course-publish', { curso: st.curso.id }).then(function(d){
+    aviso('Publicado · ' + d.aulas + ' aulas · ' + duracao(d.duracao), 'bom');
+    return abrirEditor(st.curso.id);
+  }).catch(function(e){
+    aviso(e.message, 'mau');
+    b.disabled = false;
+    b.textContent = 'Publicar curso';
+  });
+}
+
+function despublicar(){
+  if (!confirm('Tirar o curso do catálogo? Quem já comprou continua a ter acesso.')) return;
+
+  api('/course-unpublish', { curso: st.curso.id })
+    .then(function(){ aviso('Voltou a rascunho', 'bom'); return abrirEditor(st.curso.id); })
+    .catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+function apagarCurso(){
+  if (!confirm('Apagar este curso? Não há volta atrás.')) return;
+
+  api('/course-delete', { curso: st.curso.id })
+    .then(function(d){
+      aviso('Curso apagado' + (d.libertou ? ' · ' + d.libertou + ' libertos' : ''), 'bom');
+      voltarLista();
+    })
+    .catch(function(e){ aviso(e.message, 'mau'); });
+}
+
+/* ============================================================
+   LIGACOES
+   ============================================================ */
+
+$('b-marca').onclick = voltarLista;
+$('b-novo').onclick = novoCurso;
+$('b-voltar').onclick = voltarLista;
+$('b-voltar-planos').onclick = voltarDosPlanos;
+$('b-guardar').onclick = guardarDetalhes;
+$('b-modulo').onclick = novoModulo;
+$('b-publicar').onclick = publicar;
+$('b-despublicar').onclick = despublicar;
+$('b-apagar').onclick = apagarCurso;
+
+$('f-gratis').onchange = alternarPrecos;
+$('f-preco').oninput = alternarPrecos;
+$('f-promo').oninput = alternarPrecos;
+
+$('b-capa').onclick = function(){ $('in-capa').click(); };
+$('in-capa').onchange = function(){ enviarCapa($('in-capa').files[0]); };
+
+$('b-intro').onclick = function(){ $('in-intro').click(); };
+$('in-intro').onchange = function(){
+  var f = $('in-intro').files[0];
+  if (!f) return;
+
+  var caixa = $('pre-intro');
+  $('b-intro').disabled = true;
+
+  enviarVideo(f, 'intro', '', function(pct){
+    caixa.innerHTML = arcoHTML(pct);
+    $('txt-intro').textContent = 'A enviar para a Bunny';
+  }, function(bom){
+    $('b-intro').disabled = false;
+    if (bom) {
+      caixa.innerHTML = arcoHTML(100);
+      $('txt-intro').textContent = 'Enviado. A processar.';
+    } else {
+      desenharIntro();
+    }
+  });
+};
+
+$('cortina').onclick = function(ev){
+  if (ev.target === $('cortina')) fecharCortina();
+};
+
+document.addEventListener('keydown', function(ev){
+  if (ev.key === 'Escape' && !$('cortina').classList.contains('escondido')) fecharCortina();
 });
 
-servidor.listen(PORTA, function () {
-  log('curc-proxy', VERSAO, 'a ouvir na porta', PORTA);
-  log('Bubble:', BUBBLE_BASE || '(nao configurado)');
-  log('Storage:', STORAGE_ZONE ? (STORAGE_HOST + '/' + STORAGE_ZONE) : '(nao configurado)');
-  log('CDN:', CDN_HOST || '(nao configurado)');
-  log('Stream:', STREAM_LIBRARY || '(nao configurado)');
-  log('Comissao:', COMISSAO_PCT + '%');
+Array.prototype.forEach.call(document.querySelectorAll('.aba'), function(b){
+  b.onclick = function(){ trocarAba(b.getAttribute('data-aba')); };
 });
+
+window.addEventListener('beforeunload', pararSondas);
+
+arrancar();
+
+})();
+</script>
