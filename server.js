@@ -1,9 +1,13 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-5
+   versao: curc-6
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - /signup-code atribui o plano gratuito, o nome e o papel
+       logo no registo, para ninguem chegar ao estudio sem plano
+
+   Da versao curc-5:
      - planos do formador: limite de cursos e de espaco de materiais
      - POST /author-plans  lista os planos e o consumo actual
      - POST /pay-plan      cobra a adesao por M-Pesa ou e-Mola
@@ -30,7 +34,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-5';
+const VERSAO = 'curc-6';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -1092,19 +1096,39 @@ rotas['POST /signup-code'] = async function (req, res, corpo) {
   const codigo = codigoAleatorio(8);
   const expira = new Date(Date.now() + 30 * 60 * 1000).toISOString();
 
-  await bubbleActualizar(T.user, idDono, {
+  const campos = {
     'Token': codigo,
     'Token Confirmado': false,
     'Token Expires': expira
-  });
+  };
+
+  /* Conta nova: nome, papel e plano gratuito ficam logo aqui.
+     Assim ninguem chega ao estudio sem plano atribuido. */
+
+  if (!texto(utilizador['Nome Completo']) && texto(corpo.nome)) {
+    campos['Nome Completo'] = texto(corpo.nome).slice(0, 120);
+  }
+  if (!texto(utilizador['Papel'])) {
+    campos['Papel'] = 'Aluno';
+  }
+  if (!texto(utilizador['Plano Formador'])) {
+    const gratuito = await planoDoFormador(null);
+    if (gratuito) {
+      campos['Plano Formador'] = gratuito._id;
+      campos['Plano Desde'] = agora();
+    }
+    campos['Bytes Usados'] = numero(utilizador['Bytes Usados']);
+  }
+
+  await bubbleActualizar(T.user, idDono, campos);
 
   const enviado = await enviarEmail(
     email,
     'O seu codigo CURC: ' + codigo,
-    moldeCodigo(texto(utilizador['Nome Completo']), codigo)
+    moldeCodigo(texto(campos['Nome Completo'] || utilizador['Nome Completo']), codigo)
   );
 
-  ok(res, { enviado: enviado, email: email });
+  ok(res, { enviado: enviado, email: email, plano: texto(campos['Plano Formador']) || '' });
 };
 
 rotas['POST /verify-code'] = async function (req, res, corpo) {
