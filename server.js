@@ -1,23 +1,24 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-4
+   versao: curc-5
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
-     - POST /progress   grava os segundos vistos de uma aula e
-                        recalcula a percentagem da inscricao
-     - POST /lesson     devolve uma aula com o conteudo, ja com
-                        a verificacao de quem tem direito a ver
-     - POST /review     avaliar o curso com estrelas, uma por aluno
-     - POST /my-reviews  o que este aluno ja avaliou
+     - planos do formador: limite de cursos e de espaco de materiais
+     - POST /author-plans  lista os planos e o consumo actual
+     - POST /pay-plan      cobra a adesao por M-Pesa ou e-Mola
+     - /course-save trava a criacao acima do limite de cursos
+     - /upload-image trava acima do limite de espaco, apaga o
+       ficheiro antigo e desconta os bytes que ele ocupava
+     - o video nao entra em nenhuma contagem, por decisao de produto
+
+   Da versao curc-4:
+     - POST /progress, /lesson, /review, /my-reviews
 
    Da versao curc-3:
-     - variaveis de ambiente limpas ao arrancar (espacos, aspas,
-       https:// a mais, barras no fim)
-     - todos os fetch passam por buscar(), que mostra a causa real
-       em vez do inutil "fetch failed"
-     - rota POST /diag-storage que testa mesmo o Bunny Storage
-       e o Bunny Stream, e diz onde e que parte
+     - variaveis de ambiente limpas ao arrancar
+     - buscar() mostra a causa real em vez de "fetch failed"
+     - POST /diag-storage
 
    Nota sobre o CDN_HOST: o caminho publico da Bunny inclui o nome
    da zona de storage. Para a zona curc, CDN_HOST = curc.b-cdn.net/curc
@@ -29,7 +30,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-4';
+const VERSAO = 'curc-5';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -102,6 +103,7 @@ const T = {
   live: 'live',
   pagamento: 'payment',
   cartaoPendente: 'card_payment_pending',
+  planoFormador: 'plano_formador',
   levantamento: 'payout',
   avaliacao: 'review',
   duvida: 'question',
@@ -749,6 +751,135 @@ async function acessoAoCurso(idAluno, curso) {
     throw new Error('nao esta inscrito neste curso');
   }
   return { dono: false, inscricao: inscricao };
+}
+
+/* ============================================================
+   5B. PLANOS DO FORMADOR
+   ============================================================ */
+
+/* Regras:
+     Max Cursos = 0  significa ilimitado
+     Bytes Materiais conta capas, fotos e anexos
+     O video nao entra em contagem nenhuma — decisao de produto */
+
+function planoPublico(plano, extras) {
+  if (!plano) return null;
+  return Object.assign({
+    id: plano._id,
+    nome: texto(plano['Nome']),
+    slug: texto(plano['Slug']),
+    descricao: texto(plano['Descricao']),
+    max_cursos: numero(plano['Max Cursos']),
+    ilimitado: numero(plano['Max Cursos']) <= 0,
+    bytes: numero(plano['Bytes Materiais']),
+    preco: numero(plano['Preco MZN']),
+    beneficios: plano['Beneficios'] || [],
+    cor: texto(plano['Cor']),
+    ordem: numero(plano['Ordem'])
+  }, extras || {});
+}
+
+async function planosActivos() {
+  const lista = await bubbleTodos(T.planoFormador, [
+    restricao('Is Active', 'equals', true)
+  ], { maximo: 50 });
+  return lista.sort(function (a, b) { return numero(a['Ordem']) - numero(b['Ordem']); });
+}
+
+/* O plano de quem ainda nao escolheu nenhum e o mais barato
+   dos activos — na pratica, o gratuito. */
+
+async function planoDoFormador(utilizador) {
+  const id = texto(utilizador && utilizador['Plano Formador']);
+  if (id) {
+    const escolhido = await bubblePorId(T.planoFormador, id);
+    if (escolhido) return escolhido;
+  }
+  const activos = await planosActivos();
+  if (!activos.length) return null;
+
+  const gratis = activos.filter(function (p) { return numero(p['Preco MZN']) <= 0; });
+  return gratis[0] || activos[0];
+}
+
+async function cursosVivosDe(idDono) {
+  const cursos = await bubbleTodos(T.curso, [
+    restricao('Formador', 'equals', idDono)
+  ], { maximo: 500 });
+  return cursos.filter(function (c) { return !c['Is Deleted']; });
+}
+
+/* Devolve o retrato do plano e do consumo, tudo de uma vez. */
+
+async function consumoDe(idDono) {
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) throw new Error('utilizador nao encontrado');
+
+  const plano = await planoDoFormador(utilizador);
+  const cursos = await cursosVivosDe(idDono);
+  const bytes = numero(utilizador['Bytes Usados']);
+
+  const maxCursos = plano ? numero(plano['Max Cursos']) : 1;
+  const maxBytes = plano ? numero(plano['Bytes Materiais']) : 0;
+
+  return {
+    utilizador: utilizador,
+    plano: plano,
+    cursos_usados: cursos.length,
+    cursos_max: maxCursos,
+    cursos_ilimitados: maxCursos <= 0,
+    bytes_usados: bytes,
+    bytes_max: maxBytes,
+    bytes_livres: Math.max(0, maxBytes - bytes)
+  };
+}
+
+/* Trava a criacao de mais um curso quando o plano nao chega. */
+
+async function podeCriarCurso(idDono) {
+  const c = await consumoDe(idDono);
+  if (c.cursos_ilimitados) return { pode: true, consumo: c };
+
+  if (c.cursos_usados >= c.cursos_max) {
+    const nome = c.plano ? texto(c.plano['Nome']) : 'actual';
+    return {
+      pode: false,
+      consumo: c,
+      motivo: 'o plano ' + nome + ' permite ' +
+        c.cursos_max + (c.cursos_max === 1 ? ' curso' : ' cursos') +
+        ' e ja tem ' + c.cursos_usados + '. Mude de plano para criar mais.'
+    };
+  }
+  return { pode: true, consumo: c };
+}
+
+/* Trava o envio de ficheiros quando o espaco nao chega.
+   O tamanho do ficheiro que vai ser substituido nao conta,
+   senao trocar uma capa gastava espaco duas vezes. */
+
+async function podeGuardarBytes(idDono, bytes, bytesQueSaem) {
+  const c = await consumoDe(idDono);
+  const usados = Math.max(0, c.bytes_usados - numero(bytesQueSaem));
+
+  if (c.bytes_max > 0 && usados + bytes > c.bytes_max) {
+    return {
+      pode: false,
+      consumo: c,
+      motivo: 'nao ha espaco no seu plano: ' + emMB(c.bytes_max - usados) +
+        ' livres e este ficheiro tem ' + emMB(bytes) + '. Apague materiais ou mude de plano.'
+    };
+  }
+  return { pode: true, consumo: c, usados: usados };
+}
+
+function emMB(bytes) {
+  const mb = numero(bytes) / (1024 * 1024);
+  if (mb >= 1024) return (Math.round(mb / 102.4) / 10) + ' GB';
+  return Math.max(0, Math.round(mb * 10) / 10) + ' MB';
+}
+
+async function somarBytes(idDono, novoTotal) {
+  await bubbleActualizar(T.user, idDono, { 'Bytes Usados': Math.max(0, Math.round(novoTotal)) });
 }
 
 function cursoPublico(curso) {
@@ -1626,14 +1757,146 @@ rotas['POST /become-instructor'] = async function (req, res, corpo) {
     return ok(res, { formador: true, ja: true });
   }
 
+  const gratuito = await planoDoFormador(null);
+
   await bubbleActualizar(T.user, idDono, {
     'Papel': 'Formador',
     'Formador Aprovado': true,
     'Bio': texto(corpo.bio) || texto(utilizador['Bio']),
-    'Telefone': texto(corpo.telefone) || texto(utilizador['Telefone'])
+    'Telefone': texto(corpo.telefone) || texto(utilizador['Telefone']),
+    'Plano Formador': gratuito ? gratuito._id : '',
+    'Plano Desde': agora(),
+    'Bytes Usados': numero(utilizador['Bytes Usados'])
   });
 
-  ok(res, { formador: true, ja: false });
+  ok(res, { formador: true, ja: false, plano: planoPublico(gratuito) });
+};
+
+/* ---------- planos do formador ---------- */
+
+rotas['POST /author-plans'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const activos = await planosActivos();
+
+  if (!idDono) {
+    return ok(res, {
+      planos: activos.map(function (p) { return planoPublico(p); }),
+      comissao_pct: COMISSAO_PCT
+    });
+  }
+
+  const c = await consumoDe(idDono);
+
+  ok(res, {
+    planos: activos.map(function (p) {
+      return planoPublico(p, { actual: !!(c.plano && c.plano._id === p._id) });
+    }),
+    meu: planoPublico(c.plano),
+    cursos_usados: c.cursos_usados,
+    cursos_max: c.cursos_max,
+    cursos_ilimitados: c.cursos_ilimitados,
+    bytes_usados: c.bytes_usados,
+    bytes_max: c.bytes_max,
+    bytes_livres: c.bytes_livres,
+    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max),
+    plano_desde: (c.utilizador && c.utilizador['Plano Desde']) || null,
+    comissao_pct: COMISSAO_PCT
+  });
+};
+
+/* Adesao ao plano — pagamento unico, sem mensalidade.
+   Nao ha comissao a repartir: a adesao e toda da plataforma. */
+
+rotas['POST /pay-plan'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idPlano = texto(corpo.plano);
+  const numeroBruto = texto(corpo.numero);
+  let metodo = texto(corpo.metodo).toLowerCase();
+
+  if (!idDono || !idPlano) return erro(res, 'owner ou plano em falta');
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+
+  const plano = await bubblePorId(T.planoFormador, idPlano);
+  if (!plano || !plano['Is Active']) return erro(res, 'plano nao disponivel', 404);
+
+  if (texto(utilizador['Plano Formador']) === idPlano) {
+    return erro(res, 'ja esta neste plano');
+  }
+
+  const valor = numero(plano['Preco MZN']);
+
+  /* O plano gratuito nao passa pela MoPayment. */
+  if (valor <= 0) {
+    await bubbleActualizar(T.user, idDono, {
+      'Plano Formador': idPlano,
+      'Plano Desde': agora()
+    });
+    return ok(res, { pago: true, gratis: true, plano: planoPublico(plano) });
+  }
+
+  /* Descer de plano nao pode deixar o formador acima do limite novo. */
+  const cursos = await cursosVivosDe(idDono);
+  const maxNovo = numero(plano['Max Cursos']);
+  if (maxNovo > 0 && cursos.length > maxNovo) {
+    return erro(res, 'tem ' + cursos.length + ' cursos e este plano so permite ' +
+      maxNovo + '. Apague os que sobram antes de mudar.');
+  }
+
+  const numeroLimpo = normalizarNumero(numeroBruto);
+  if (numeroLimpo.length !== 9) {
+    return erro(res, 'numero invalido — devem ser 9 digitos, por exemplo 841234567');
+  }
+
+  if (!metodo) metodo = operadoraDoNumero(numeroLimpo);
+  if (metodo !== 'mpesa' && metodo !== 'emola') {
+    return erro(res, 'nao reconheci a operadora deste numero — escolha M-Pesa ou e-Mola');
+  }
+
+  const nomeCliente = texto(utilizador['Nome Completo']) || 'Formador CURC';
+  const resultado = await cobrarCarteira(metodo, numeroLimpo, nomeCliente, valor);
+
+  const idPagamento = await bubbleCriar(T.pagamento, {
+    'User': idDono,
+    'Metodo': metodo,
+    'Telefone': numeroLimpo,
+    'Valor MZN': valor,
+    'Item Type': 'plano',
+    'Item Name': texto(plano['Nome']),
+    'Item ID': idPlano,
+    'Estado': resultado.sucesso ? 'Pago' : 'Falhou',
+    'Transaction': resultado.transacao,
+    'Message': resultado.mensagem,
+    'Raw': resultado.bruto,
+    'Comissao MZN': resultado.sucesso ? valor : 0,
+    'Liquido MZN': 0
+  });
+
+  if (!resultado.sucesso) {
+    return responder(res, 200, {
+      ok: false,
+      pago: false,
+      erro: resultado.mensagem,
+      codigo: resultado.codigo,
+      pagamento: idPagamento
+    });
+  }
+
+  await bubbleActualizar(T.user, idDono, {
+    'Plano Formador': idPlano,
+    'Plano Desde': agora()
+  });
+
+  log('Adesao aceite', metodo, valor, 'MZN — plano', texto(plano['Nome']));
+
+  ok(res, {
+    pago: true,
+    valor: valor,
+    transacao: resultado.transacao,
+    pagamento: idPagamento,
+    plano: planoPublico(plano)
+  });
 };
 
 rotas['POST /studio-courses'] = async function (req, res, corpo) {
@@ -1676,6 +1939,8 @@ rotas['POST /studio-stats'] = async function (req, res, corpo) {
 
   const publicados = cursos.filter(function (c) { return texto(c['Estado']) === 'Publicado'; });
 
+  const c = await consumoDe(idDono);
+
   ok(res, {
     saldo: numero(utilizador['Saldo MZN']),
     total_ganho: numero(utilizador['Total Ganho MZN']),
@@ -1683,7 +1948,14 @@ rotas['POST /studio-stats'] = async function (req, res, corpo) {
     cursos_publicados: publicados.length,
     alunos: alunosUnicos.size,
     inscricoes: inscricoes.length,
-    comissao_pct: COMISSAO_PCT
+    comissao_pct: COMISSAO_PCT,
+    plano: planoPublico(c.plano),
+    cursos_max: c.cursos_max,
+    cursos_ilimitados: c.cursos_ilimitados,
+    pode_criar: c.cursos_ilimitados || c.cursos_usados < c.cursos_max,
+    bytes_usados: c.bytes_usados,
+    bytes_max: c.bytes_max,
+    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max)
   });
 };
 
@@ -1743,6 +2015,12 @@ rotas['POST /course-save'] = async function (req, res, corpo) {
   }
 
   if (!campos['Nivel']) campos['Nivel'] = 'Iniciante';
+
+  /* So aqui, na criacao. Editar um curso que ja existe nunca
+     e travado, mesmo que o formador tenha descido de plano. */
+  const cabe = await podeCriarCurso(idDono);
+  if (!cabe.pode) return erro(res, cabe.motivo);
+
   campos['Formador'] = idDono;
   campos['Slug'] = slugificar(titulo) + '-' + codigoAleatorio(4).toLowerCase();
   campos['Estado'] = 'Rascunho';
@@ -1814,12 +2092,25 @@ rotas['POST /course-delete'] = async function (req, res, corpo) {
     return erro(res, 'este curso ja tem alunos inscritos e nao pode ser apagado');
   }
 
+  /* A capa sai do disco e da conta de espaco. */
+  const caminhoCapa = texto(curso['Capa Path']);
+  const bytesCapa = numero(curso['Capa Bytes']);
+  if (caminhoCapa) await storageApagar(caminhoCapa);
+  if (bytesCapa > 0) {
+    const utilizador = await bubblePorId(T.user, idDono);
+    if (utilizador) {
+      await somarBytes(idDono, numero(utilizador['Bytes Usados']) - bytesCapa);
+    }
+  }
+
   await bubbleActualizar(T.curso, idCurso, {
     'Is Deleted': true,
-    'Estado': 'Suspenso'
+    'Estado': 'Suspenso',
+    'Capa Path': '',
+    'Capa Bytes': 0
   });
 
-  ok(res, { apagado: true });
+  ok(res, { apagado: true, libertou: emMB(bytesCapa) });
 };
 
 /* ---------- modulos ---------- */
@@ -2107,18 +2398,53 @@ rotas['POST /upload-image'] = async function (req, res, corpo) {
 
   if (alvo === 'capa') {
     const idCurso = texto(corpo.curso);
-    await cursoDoFormador(idDono, idCurso);
+    const curso = await cursoDoFormador(idDono, idCurso);
+
+    /* O que la estava sai da conta e do disco. */
+    const caminhoAntigo = texto(curso['Capa Path']);
+    const bytesAntigos = numero(curso['Capa Bytes']);
+
+    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
+    if (!cabe.pode) return erro(res, cabe.motivo);
+
     caminho = 'capas/' + idCurso + '-' + Date.now() + '.' + extensao;
     const url = await storageGuardar(caminho, bytes, tipoMime);
-    await bubbleActualizar(T.curso, idCurso, { 'Capa URL': url });
-    return ok(res, { url: url });
+
+    if (caminhoAntigo) await storageApagar(caminhoAntigo);
+
+    await bubbleActualizar(T.curso, idCurso, {
+      'Capa URL': url,
+      'Capa Path': caminho,
+      'Capa Bytes': bytes.length
+    });
+    await somarBytes(idDono, cabe.usados + bytes.length);
+
+    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
   }
 
   if (alvo === 'perfil') {
+    const utilizador = await bubblePorId(T.user, idDono);
+    if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+
+    const caminhoAntigo = texto(utilizador['Foto Path']);
+    const bytesAntigos = numero(utilizador['Foto Bytes']);
+
+    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
+    if (!cabe.pode) return erro(res, cabe.motivo);
+
     caminho = 'perfis/' + idDono + '-' + Date.now() + '.' + extensao;
     const url = await storageGuardar(caminho, bytes, tipoMime);
-    await bubbleActualizar(T.user, idDono, { 'Foto URL': url });
-    return ok(res, { url: url });
+
+    if (caminhoAntigo) await storageApagar(caminhoAntigo);
+
+    await bubbleActualizar(T.user, idDono, {
+      'Foto URL': url,
+      'Foto Path': caminho,
+      'Foto Bytes': bytes.length,
+      'Bytes Usados': Math.max(0, Math.round(cabe.usados + bytes.length))
+    });
+
+    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
   }
 
   erro(res, 'alvo deve ser capa ou perfil');
