@@ -1,9 +1,24 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-7
+   versao: curc-8
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - area de membro de cada curso, com tres partes:
+         avisos do formador, duvidas dos alunos, e materiais
+     - marca propria do curso: cor, logotipo e mensagem de
+       boas-vindas, definidos pelo formador
+     - POST /space            tudo o que a area de membro precisa
+     - POST /announce         criar ou editar um aviso (dono)
+     - POST /announce-delete
+     - POST /ask              o aluno pergunta
+     - POST /answer           formador ou aluno responde
+     - POST /question-delete
+     - POST /material-upload  PDF ou ficheiro de apoio
+     - POST /material-delete
+     - os materiais contam para o espaco do plano; o video nao
+
+   Da versao curc-7:
      - programa de afiliados. O dono do curso decide quanto da,
        entre AFILIADO_MIN_PCT e AFILIADO_MAX_PCT. A parte do
        afiliado sai do bolo do formador, nunca do da plataforma.
@@ -44,7 +59,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-7';
+const VERSAO = 'curc-8';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -124,6 +139,9 @@ const T = {
   cartaoPendente: 'card_payment_pending',
   planoFormador: 'plano_formador',
   afiliado: 'afiliado',
+  anuncio: 'anuncio',
+  resposta: 'resposta',
+  material: 'material',
   levantamento: 'payout',
   avaliacao: 'review',
   duvida: 'question',
@@ -2051,6 +2069,457 @@ rotas['POST /course-affiliates'] = async function (req, res, corpo) {
 };
 
 /* ============================================================
+   6D. AREA DE MEMBRO DO CURSO
+   ============================================================ */
+
+/* Ficheiros de apoio. Nao aceito executaveis nem arquivos —
+   nao ha razao para um curso precisar deles e sao um risco. */
+
+const MATERIAIS_ACEITES = {
+  'application/pdf': 'pdf',
+  'application/msword': 'doc',
+  'application/vnd.openxmlformats-officedocument.wordprocessingml.document': 'docx',
+  'application/vnd.ms-excel': 'xls',
+  'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet': 'xlsx',
+  'application/vnd.ms-powerpoint': 'ppt',
+  'application/vnd.openxmlformats-officedocument.presentationml.presentation': 'pptx',
+  'text/plain': 'txt',
+  'text/csv': 'csv',
+  'image/jpeg': 'jpg',
+  'image/png': 'png',
+  'image/webp': 'webp',
+  'audio/mpeg': 'mp3',
+  'audio/mp4': 'm4a'
+};
+
+/* Um nome de ficheiro que sobreviva ao caminho do Bunny. */
+
+function nomeSeguro(valor, extensao) {
+  const limpo = texto(valor)
+    .normalize('NFD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .replace(/[^a-zA-Z0-9._ -]/g, '')
+    .replace(/\s+/g, '-')
+    .replace(/-+/g, '-')
+    .replace(/\.{2,}/g, '.')      /* .. nunca chega ao caminho */
+    .replace(/^[.-]+/, '')        /* nem nomes escondidos */
+    .slice(0, 70);
+  const semExtensao = limpo.replace(/\.[^.]*$/, '').replace(/[.-]+$/, '') || 'ficheiro';
+  return semExtensao + '.' + extensao;
+}
+
+function anuncioPublico(a) {
+  return {
+    id: a._id,
+    titulo: texto(a['Titulo']),
+    texto: texto(a['Texto']),
+    fixado: !!a['Fixado'],
+    data: a['Created Date'] || null
+  };
+}
+
+function materialPublico(m) {
+  return {
+    id: m._id,
+    nome: texto(m['Nome']),
+    tipo: texto(m['Tipo']),
+    url: texto(m['URL']),
+    bytes: numero(m['Bytes']),
+    aula: texto(m['Aula']),
+    data: m['Created Date'] || null
+  };
+}
+
+/* Tudo o que a area de membro precisa, numa chamada so.
+   Com rede fraca, cinco pedidos separados sao cinco hipoteses
+   de falhar. */
+
+rotas['POST /space'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  let direito;
+  try {
+    direito = await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  const avisos = (await bubbleTodos(T.anuncio, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 200 })).filter(function (a) { return !a['Is Deleted']; });
+
+  avisos.sort(function (a, b) {
+    if (!!b['Fixado'] !== !!a['Fixado']) return b['Fixado'] ? 1 : -1;
+    return new Date(b['Created Date'] || 0) - new Date(a['Created Date'] || 0);
+  });
+
+  const materiais = (await bubbleTodos(T.material, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 300 })).filter(function (m) { return !m['Is Deleted']; });
+
+  const duvidas = (await bubbleTodos(T.duvida, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 300 })).filter(function (d) { return !d['Is Deleted']; });
+
+  duvidas.sort(function (a, b) {
+    return new Date(b['Created Date'] || 0) - new Date(a['Created Date'] || 0);
+  });
+
+  /* As respostas vem todas de uma vez e agrupam-se aqui,
+     em vez de uma chamada por duvida. */
+  const respostas = (await bubbleTodos(T.resposta, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1000 })).filter(function (r) { return !r['Is Deleted']; });
+
+  const nomes = {};
+  const porPessoa = Array.from(new Set(
+    duvidas.map(function (d) { return texto(d['Aluno']); })
+      .concat(respostas.map(function (r) { return texto(r['Autor']); }))
+      .filter(Boolean)
+  ));
+  for (const id of porPessoa) {
+    const p = await bubblePorId(T.user, id);
+    nomes[id] = p ? { nome: texto(p['Nome Completo']), foto: texto(p['Foto URL']) } : null;
+  }
+
+  const agrupadas = {};
+  respostas.forEach(function (r) {
+    const chave = texto(r['Duvida']);
+    if (!agrupadas[chave]) agrupadas[chave] = [];
+    const quem = nomes[texto(r['Autor'])] || {};
+    agrupadas[chave].push({
+      id: r._id,
+      texto: texto(r['Texto']),
+      autor: quem.nome || 'Alguém',
+      foto: quem.foto || '',
+      do_formador: !!r['E Formador'],
+      meu: texto(r['Autor']) === idDono,
+      data: r['Created Date'] || null
+    });
+  });
+
+  Object.keys(agrupadas).forEach(function (k) {
+    agrupadas[k].sort(function (a, b) {
+      return new Date(a.data || 0) - new Date(b.data || 0);
+    });
+  });
+
+  const formador = await bubblePorId(T.user, texto(curso['Formador']));
+
+  ok(res, {
+    curso: {
+      id: curso._id,
+      titulo: texto(curso['Titulo']),
+      capa: texto(curso['Capa URL']),
+      cor: texto(curso['Cor Marca']),
+      logo: texto(curso['Logo URL']),
+      boas_vindas: texto(curso['Boas Vindas']),
+      total_aulas: numero(curso['Total Aulas']),
+      duracao: numero(curso['Duracao Segundos'])
+    },
+    formador: formadorPublico(formador),
+    e_dono: !!direito.dono,
+    inscricao: direito.inscricao ? {
+      progresso: numero(direito.inscricao['Progresso Pct']),
+      aulas_concluidas: numero(direito.inscricao['Aulas Concluidas']),
+      concluido: !!direito.inscricao['Concluido'],
+      ultima_aula: texto(direito.inscricao['Ultima Aula'])
+    } : null,
+    avisos: avisos.map(anuncioPublico),
+    materiais: materiais.map(materialPublico),
+    duvidas: duvidas.map(function (d) {
+      const quem = nomes[texto(d['Aluno'])] || {};
+      return {
+        id: d._id,
+        texto: texto(d['Texto']),
+        aula: texto(d['Aula']),
+        autor: quem.nome || 'Alguém',
+        foto: quem.foto || '',
+        meu: texto(d['Aluno']) === idDono,
+        respondida: !!d['Respondida'],
+        data: d['Created Date'] || null,
+        respostas: agrupadas[d._id] || []
+      };
+    })
+  });
+};
+
+/* ---------- avisos do formador ---------- */
+
+rotas['POST /announce'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idAviso = texto(corpo.aviso);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const titulo = texto(corpo.titulo).slice(0, 140);
+  const conteudo = texto(corpo.texto).slice(0, 4000);
+  if (!titulo && !conteudo) return erro(res, 'o aviso precisa de titulo ou texto');
+
+  const campos = {
+    'Titulo': titulo,
+    'Texto': conteudo,
+    'Fixado': corpo.fixado === true
+  };
+
+  if (idAviso) {
+    const aviso = await bubblePorId(T.anuncio, idAviso);
+    if (!aviso || texto(aviso['Curso']) !== idCurso) return erro(res, 'aviso nao encontrado', 404);
+    await bubbleActualizar(T.anuncio, idAviso, campos);
+    return ok(res, { aviso: idAviso, novo: false });
+  }
+
+  campos['Curso'] = idCurso;
+  campos['Formador'] = idDono;
+  campos['Is Deleted'] = false;
+
+  const novo = await bubbleCriar(T.anuncio, campos);
+  ok(res, { aviso: novo, novo: true });
+};
+
+rotas['POST /announce-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idAviso = texto(corpo.aviso);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const aviso = await bubblePorId(T.anuncio, idAviso);
+  if (!aviso || texto(aviso['Curso']) !== idCurso) return erro(res, 'aviso nao encontrado', 404);
+
+  await bubbleActualizar(T.anuncio, idAviso, { 'Is Deleted': true });
+  ok(res, { apagado: true });
+};
+
+/* ---------- duvidas ---------- */
+
+rotas['POST /ask'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const conteudo = texto(corpo.texto).slice(0, 2000);
+
+  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
+  if (conteudo.length < 3) return erro(res, 'escreva a sua duvida');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  try {
+    await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  const id = await bubbleCriar(T.duvida, {
+    'Curso': idCurso,
+    'Aluno': idDono,
+    'Aula': texto(corpo.aula),
+    'Formador': texto(curso['Formador']),
+    'Texto': conteudo,
+    'Respondida': false,
+    'Is Deleted': false
+  });
+
+  ok(res, { duvida: id });
+};
+
+rotas['POST /answer'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idDuvida = texto(corpo.duvida);
+  const conteudo = texto(corpo.texto).slice(0, 2000);
+
+  if (!idDono || !idDuvida) return erro(res, 'owner ou duvida em falta');
+  if (conteudo.length < 2) return erro(res, 'escreva a resposta');
+
+  const duvida = await bubblePorId(T.duvida, idDuvida);
+  if (!duvida || duvida['Is Deleted']) return erro(res, 'duvida nao encontrada', 404);
+
+  const curso = await bubblePorId(T.curso, texto(duvida['Curso']));
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  let direito;
+  try {
+    direito = await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  const id = await bubbleCriar(T.resposta, {
+    'Duvida': idDuvida,
+    'Curso': curso._id,
+    'Autor': idDono,
+    'Texto': conteudo,
+    'E Formador': !!direito.dono,
+    'Is Deleted': false
+  });
+
+  /* So a resposta do formador fecha a duvida. */
+  if (direito.dono && !duvida['Respondida']) {
+    await bubbleActualizar(T.duvida, idDuvida, { 'Respondida': true });
+  }
+
+  ok(res, { resposta: id, do_formador: !!direito.dono });
+};
+
+/* Cada um apaga o que escreveu. O formador apaga o que quiser
+   no curso dele — e ele que responde por aquele espaco. */
+
+rotas['POST /question-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idDuvida = texto(corpo.duvida);
+  const idResposta = texto(corpo.resposta);
+
+  if (!idDono) return erro(res, 'owner em falta');
+
+  if (idResposta) {
+    const resposta = await bubblePorId(T.resposta, idResposta);
+    if (!resposta || resposta['Is Deleted']) return erro(res, 'resposta nao encontrada', 404);
+
+    const curso = await bubblePorId(T.curso, texto(resposta['Curso']));
+    const eDono = curso && texto(curso['Formador']) === idDono;
+    if (texto(resposta['Autor']) !== idDono && !eDono) {
+      return erro(res, 'nao pode apagar isto', 403);
+    }
+
+    await bubbleActualizar(T.resposta, idResposta, { 'Is Deleted': true });
+    return ok(res, { apagado: 'resposta' });
+  }
+
+  const duvida = await bubblePorId(T.duvida, idDuvida);
+  if (!duvida || duvida['Is Deleted']) return erro(res, 'duvida nao encontrada', 404);
+
+  const curso = await bubblePorId(T.curso, texto(duvida['Curso']));
+  const eDono = curso && texto(curso['Formador']) === idDono;
+  if (texto(duvida['Aluno']) !== idDono && !eDono) {
+    return erro(res, 'nao pode apagar isto', 403);
+  }
+
+  await bubbleActualizar(T.duvida, idDuvida, { 'Is Deleted': true });
+  ok(res, { apagado: 'duvida' });
+};
+
+/* ---------- materiais ---------- */
+
+rotas['POST /material-upload'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const tipoMime = texto(corpo.mime).toLowerCase();
+  const base64 = texto(corpo.dados);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  if (!base64) return erro(res, 'ficheiro em falta');
+
+  const extensao = MATERIAIS_ACEITES[tipoMime];
+  if (!extensao) {
+    return erro(res, 'tipo de ficheiro nao aceite. Use PDF, Word, Excel, PowerPoint, texto, imagem ou audio');
+  }
+
+  const bytes = Buffer.from(base64.replace(/^data:[^,]+,/, ''), 'base64');
+  if (!bytes.length) return erro(res, 'ficheiro vazio');
+  if (bytes.length > 25 * 1024 * 1024) return erro(res, 'o ficheiro passa dos 25 MB');
+
+  const cabe = await podeGuardarBytes(idDono, bytes.length, 0);
+  if (!cabe.pode) return erro(res, cabe.motivo);
+
+  const nome = nomeSeguro(corpo.nome, extensao);
+  const caminho = 'materiais/' + idCurso + '/' + Date.now() + '-' + nome;
+
+  const url = await storageGuardar(caminho, bytes, tipoMime);
+
+  const id = await bubbleCriar(T.material, {
+    'Curso': idCurso,
+    'Formador': idDono,
+    'Aula': texto(corpo.aula),
+    'Nome': texto(corpo.nome).slice(0, 140) || nome,
+    'Tipo': extensao,
+    'URL': url,
+    'Path': caminho,
+    'Bytes': bytes.length,
+    'Is Deleted': false
+  });
+
+  await somarBytes(idDono, cabe.usados + bytes.length);
+
+  ok(res, {
+    material: id,
+    url: url,
+    nome: texto(corpo.nome) || nome,
+    tipo: extensao,
+    bytes: bytes.length,
+    bytes_usados: cabe.usados + bytes.length
+  });
+};
+
+rotas['POST /material-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idMaterial = texto(corpo.material);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const material = await bubblePorId(T.material, idMaterial);
+  if (!material || texto(material['Curso']) !== idCurso) {
+    return erro(res, 'material nao encontrado', 404);
+  }
+
+  const caminho = texto(material['Path']);
+  const bytes = numero(material['Bytes']);
+
+  if (caminho) await storageApagar(caminho);
+  await bubbleActualizar(T.material, idMaterial, { 'Is Deleted': true });
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (utilizador && bytes > 0) {
+    await somarBytes(idDono, numero(utilizador['Bytes Usados']) - bytes);
+  }
+
+  ok(res, { apagado: true, libertou: emMB(bytes) });
+};
+
+/* O formador ve tudo do lado dele, mesmo o que ainda nao publicou. */
+
+rotas['POST /studio-space'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+
+  const curso = await cursoDoFormador(idDono, idCurso);
+
+  const avisos = (await bubbleTodos(T.anuncio, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 200 })).filter(function (a) { return !a['Is Deleted']; });
+
+  const materiais = (await bubbleTodos(T.material, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 300 })).filter(function (m) { return !m['Is Deleted']; });
+
+  const duvidas = (await bubbleTodos(T.duvida, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 300 })).filter(function (d) { return !d['Is Deleted']; });
+
+  const porResponder = duvidas.filter(function (d) { return !d['Respondida']; }).length;
+
+  ok(res, {
+    marca: {
+      cor: texto(curso['Cor Marca']),
+      logo: texto(curso['Logo URL']),
+      boas_vindas: texto(curso['Boas Vindas'])
+    },
+    avisos: avisos.map(anuncioPublico),
+    materiais: materiais.map(materialPublico),
+    duvidas_total: duvidas.length,
+    duvidas_por_responder: porResponder,
+    bytes_materiais: materiais.reduce(function (s, m) { return s + numero(m['Bytes']); }, 0)
+  });
+};
+
+/* ============================================================
    6B. ESTUDIO DO FORMADOR
    ============================================================ */
 
@@ -2310,6 +2779,13 @@ rotas['POST /course-save'] = async function (req, res, corpo) {
   if (veio('categoria')) campos['Categoria'] = texto(corpo.categoria);
   if (veio('nivel')) campos['Nivel'] = texto(corpo.nivel) || 'Iniciante';
   if (veio('certificado')) campos['Tem Certificado'] = corpo.certificado === true;
+
+  /* Marca propria da area de membro. */
+  if (veio('cor_marca')) {
+    const cor = texto(corpo.cor_marca);
+    campos['Cor Marca'] = /^#[0-9A-Fa-f]{6}$/.test(cor) ? cor : '';
+  }
+  if (veio('boas_vindas')) campos['Boas Vindas'] = texto(corpo.boas_vindas).slice(0, 1000);
 
   /* Afiliados. O minimo e obrigatorio: quem liga tem de dar
      pelo menos AFILIADO_MIN_PCT, senao nao vale a pena a ninguem. */
@@ -2757,6 +3233,31 @@ rotas['POST /upload-image'] = async function (req, res, corpo) {
     return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
   }
 
+  if (alvo === 'logo') {
+    const idCurso = texto(corpo.curso);
+    const curso = await cursoDoFormador(idDono, idCurso);
+
+    const caminhoAntigo = texto(curso['Logo Path']);
+    const bytesAntigos = numero(curso['Logo Bytes']);
+
+    const cabe = await podeGuardarBytes(idDono, bytes.length, bytesAntigos);
+    if (!cabe.pode) return erro(res, cabe.motivo);
+
+    caminho = 'logos/' + idCurso + '-' + Date.now() + '.' + extensao;
+    const url = await storageGuardar(caminho, bytes, tipoMime);
+
+    if (caminhoAntigo) await storageApagar(caminhoAntigo);
+
+    await bubbleActualizar(T.curso, idCurso, {
+      'Logo URL': url,
+      'Logo Path': caminho,
+      'Logo Bytes': bytes.length
+    });
+    await somarBytes(idDono, cabe.usados + bytes.length);
+
+    return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
+  }
+
   if (alvo === 'perfil') {
     const utilizador = await bubblePorId(T.user, idDono);
     if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
@@ -2782,7 +3283,7 @@ rotas['POST /upload-image'] = async function (req, res, corpo) {
     return ok(res, { url: url, bytes_usados: cabe.usados + bytes.length });
   }
 
-  erro(res, 'alvo deve ser capa ou perfil');
+  erro(res, 'alvo deve ser capa, logo ou perfil');
 };
 
 /* ---------- ver o curso como dono, com tudo a descoberto ---------- */
@@ -2864,7 +3365,9 @@ const servidor = http.createServer(async function (req, res) {
   let corpo = {};
   if (req.method === 'POST') {
     try {
-      corpo = await lerCorpo(req, caminho === '/upload-image' ? 10 : 2);
+      const limite = caminho === '/material-upload' ? 40
+                   : (caminho === '/upload-image' ? 10 : 2);
+      corpo = await lerCorpo(req, limite);
     } catch (e) {
       return erro(res, e.message);
     }
