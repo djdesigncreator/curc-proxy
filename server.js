@@ -3308,7 +3308,10 @@ rotas['POST /studio-course'] = async function (req, res, corpo) {
       aprende: curso['O Que Vai Aprender'] || [],
       requisitos: curso['Requisitos'] || [],
       estado: texto(curso['Estado']) || 'Rascunho',
-      intro_video_id: texto(curso['Intro Video ID'])
+      intro_video_id: texto(curso['Intro Video ID']),
+      cor_marca: texto(curso['Cor Marca']),
+      logo: texto(curso['Logo URL']),
+      boas_vindas: texto(curso['Boas Vindas'])
     }),
     modulos: modulos.map(function (m) {
       return {
