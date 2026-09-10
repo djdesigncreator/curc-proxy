@@ -1,15 +1,26 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-3
+   versao: curc-4
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - POST /progress   grava os segundos vistos de uma aula e
+                        recalcula a percentagem da inscricao
+     - POST /lesson     devolve uma aula com o conteudo, ja com
+                        a verificacao de quem tem direito a ver
+     - POST /review     avaliar o curso com estrelas, uma por aluno
+     - POST /my-reviews  o que este aluno ja avaliou
+
+   Da versao curc-3:
      - variaveis de ambiente limpas ao arrancar (espacos, aspas,
        https:// a mais, barras no fim)
      - todos os fetch passam por buscar(), que mostra a causa real
        em vez do inutil "fetch failed"
      - rota POST /diag-storage que testa mesmo o Bunny Storage
        e o Bunny Stream, e diz onde e que parte
+
+   Nota sobre o CDN_HOST: o caminho publico da Bunny inclui o nome
+   da zona de storage. Para a zona curc, CDN_HOST = curc.b-cdn.net/curc
 
    Sem dependencias externas. Corre com node >= 18.
    ============================================================ */
@@ -18,7 +29,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-3';
+const VERSAO = 'curc-4';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -678,6 +689,68 @@ async function recontarCurso(idCurso) {
   return { aulas: vivas.length, duracao: duracao };
 }
 
+/* Conta as aulas vivas e as que este aluno ja concluiu.
+   Nao grava nada — so devolve os numeros. */
+
+async function contarProgresso(idAluno, idCurso) {
+  const aulas = (await bubbleTodos(T.aula, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1000 })).filter(function (a) { return !a['Is Deleted']; });
+
+  const vivas = {};
+  aulas.forEach(function (a) { vivas[a._id] = true; });
+
+  const progressos = await bubbleTodos(T.progresso, [
+    restricao('Aluno', 'equals', idAluno),
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1000 });
+
+  /* So contam as aulas que ainda existem. Se o formador apagar uma
+     aula ja vista, a percentagem tem de descer, nao passar dos 100. */
+  const concluidas = progressos.filter(function (p) {
+    return p['Concluida'] && vivas[texto(p['Aula'])];
+  }).length;
+
+  const total = aulas.length;
+
+  return {
+    total: total,
+    concluidas: concluidas,
+    pct: total ? Math.round((concluidas / total) * 100) : 0
+  };
+}
+
+/* Recalcula a media de estrelas de um curso a partir das avaliacoes vivas. */
+
+async function recalcularEstrelas(idCurso) {
+  const todas = (await bubbleTodos(T.avaliacao, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 2000 })).filter(function (a) { return !a['Is Deleted']; });
+
+  const soma = todas.reduce(function (s, a) { return s + numero(a['Estrelas']); }, 0);
+  const media = todas.length ? Math.round((soma / todas.length) * 10) / 10 : 0;
+
+  await bubbleActualizar(T.curso, idCurso, {
+    'Media Estrelas': media,
+    'Total Avaliacoes': todas.length
+  });
+
+  return { media: media, total: todas.length };
+}
+
+/* Confirma que este aluno pode mesmo ver o conteudo do curso.
+   Devolve a inscricao, ou null se for o proprio formador. */
+
+async function acessoAoCurso(idAluno, curso) {
+  if (texto(curso['Formador']) === idAluno) return { dono: true, inscricao: null };
+
+  const inscricao = await inscricaoDe(idAluno, curso._id);
+  if (!inscricao || !inscricao['Is Active']) {
+    throw new Error('nao esta inscrito neste curso');
+  }
+  return { dono: false, inscricao: inscricao };
+}
+
 function cursoPublico(curso) {
   return {
     id: curso._id,
@@ -1308,6 +1381,233 @@ rotas['POST /my-courses'] = async function (req, res, corpo) {
   }
 
   ok(res, { cursos: saida });
+};
+
+/* ============================================================
+   6A. LEITOR DO ALUNO
+   ============================================================ */
+
+/* Uma aula com o conteudo. O direito a ver e verificado aqui,
+   nao no browser. Uma aula marcada como livre abre a qualquer um. */
+
+rotas['POST /lesson'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idAula = texto(corpo.aula);
+  if (!idAula) return erro(res, 'aula em falta');
+
+  const aula = await bubblePorId(T.aula, idAula);
+  if (!aula || aula['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  const curso = await bubblePorId(T.curso, texto(aula['Curso']));
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  const eDono = idDono && texto(curso['Formador']) === idDono;
+  let inscricao = null;
+
+  if (!eDono && !aula['E Livre']) {
+    if (!idDono) return erro(res, 'entre na sua conta para ver esta aula', 403);
+    inscricao = await inscricaoDe(idDono, curso._id);
+    if (!inscricao || !inscricao['Is Active']) {
+      return erro(res, 'precisa de se inscrever para ver esta aula', 403);
+    }
+  }
+
+  let visto = null;
+  if (idDono) {
+    const achados = await bubbleTodos(T.progresso, [
+      restricao('Aluno', 'equals', idDono),
+      restricao('Aula', 'equals', idAula)
+    ], { maximo: 1 });
+    if (achados[0]) {
+      visto = {
+        segundos: numero(achados[0]['Segundos Vistos']),
+        concluida: !!achados[0]['Concluida']
+      };
+    }
+  }
+
+  ok(res, {
+    aula: {
+      id: aula._id,
+      curso: texto(aula['Curso']),
+      modulo: texto(aula['Modulo']),
+      titulo: texto(aula['Titulo']),
+      descricao: texto(aula['Descricao']),
+      tipo: texto(aula['Tipo']),
+      texto: texto(aula['Texto']),
+      duracao: numero(aula['Duracao Segundos']),
+      livre: !!aula['E Livre'],
+      playback: texto(aula['Playback URL']),
+      thumb: texto(aula['Thumbnail URL']),
+      estado_video: texto(aula['Estado Video'])
+    },
+    visto: visto,
+    e_dono: !!eDono
+  });
+};
+
+/* Grava onde o aluno vai na aula e recalcula a inscricao.
+   Chamado de tempos a tempos pelo leitor, e ao marcar como concluida. */
+
+rotas['POST /progress'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idAula = texto(corpo.aula);
+  const segundos = Math.max(0, Math.round(numero(corpo.segundos)));
+  const marcar = Object.prototype.hasOwnProperty.call(corpo, 'concluida');
+
+  if (!idDono || !idAula) return erro(res, 'owner ou aula em falta');
+
+  const aula = await bubblePorId(T.aula, idAula);
+  if (!aula || aula['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  const idCurso = texto(aula['Curso']);
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  let direito;
+  try {
+    direito = await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  /* O formador ve as suas proprias aulas mas nao acumula progresso. */
+  if (direito.dono) {
+    return ok(res, { gravado: false, motivo: 'e o formador deste curso' });
+  }
+
+  const achados = await bubbleTodos(T.progresso, [
+    restricao('Aluno', 'equals', idDono),
+    restricao('Aula', 'equals', idAula)
+  ], { maximo: 1 });
+
+  const anterior = achados[0] || null;
+  const duracao = numero(aula['Duracao Segundos']);
+
+  /* A aula da-se por vista aos 90 por cento, ou se o leitor disser
+     explicitamente que acabou. Nunca desmarca sozinha. */
+  let concluida = anterior ? !!anterior['Concluida'] : false;
+  if (marcar) concluida = corpo.concluida === true;
+  else if (duracao > 0 && segundos >= duracao * 0.9) concluida = true;
+
+  /* O contador nunca anda para tras — se a pessoa voltar ao inicio,
+     o ponto de retoma mais adiantado mantem-se. */
+  const guardados = anterior
+    ? Math.max(numero(anterior['Segundos Vistos']), segundos)
+    : segundos;
+
+  if (anterior) {
+    await bubbleActualizar(T.progresso, anterior._id, {
+      'Segundos Vistos': guardados,
+      'Concluida': concluida
+    });
+  } else {
+    await bubbleCriar(T.progresso, {
+      'Aluno': idDono,
+      'Curso': idCurso,
+      'Aula': idAula,
+      'Segundos Vistos': guardados,
+      'Concluida': concluida
+    });
+  }
+
+  const contagem = await contarProgresso(idDono, idCurso);
+  const acabou = contagem.total > 0 && contagem.concluidas >= contagem.total;
+
+  const campos = {
+    'Progresso Pct': contagem.pct,
+    'Aulas Concluidas': contagem.concluidas,
+    'Ultima Aula': idAula,
+    'Concluido': acabou
+  };
+  if (acabou && !direito.inscricao['Concluido']) {
+    campos['Concluido Data'] = agora();
+  }
+
+  await bubbleActualizar(T.inscricao, direito.inscricao._id, campos);
+
+  ok(res, {
+    gravado: true,
+    segundos: guardados,
+    concluida: concluida,
+    pct: contagem.pct,
+    aulas_concluidas: contagem.concluidas,
+    total_aulas: contagem.total,
+    curso_concluido: acabou
+  });
+};
+
+/* Avaliar o curso. Uma avaliacao por aluno — a segunda substitui a primeira. */
+
+rotas['POST /review'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const estrelas = Math.round(numero(corpo.estrelas));
+  const comentario = texto(corpo.texto).slice(0, 1500);
+
+  if (!idDono || !idCurso) return erro(res, 'owner ou curso em falta');
+  if (estrelas < 1 || estrelas > 5) return erro(res, 'as estrelas vao de 1 a 5');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+  if (texto(curso['Formador']) === idDono) return erro(res, 'nao pode avaliar o seu proprio curso');
+
+  const inscricao = await inscricaoDe(idDono, idCurso);
+  if (!inscricao || !inscricao['Is Active']) {
+    return erro(res, 'so quem esta inscrito pode avaliar', 403);
+  }
+
+  const achadas = await bubbleTodos(T.avaliacao, [
+    restricao('Aluno', 'equals', idDono),
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 1 });
+
+  if (achadas[0]) {
+    await bubbleActualizar(T.avaliacao, achadas[0]._id, {
+      'Estrelas': estrelas,
+      'Texto': comentario,
+      'Is Deleted': false
+    });
+  } else {
+    await bubbleCriar(T.avaliacao, {
+      'Aluno': idDono,
+      'Curso': idCurso,
+      'Formador': texto(curso['Formador']),
+      'Estrelas': estrelas,
+      'Texto': comentario,
+      'Is Deleted': false
+    });
+  }
+
+  const media = await recalcularEstrelas(idCurso);
+
+  ok(res, {
+    avaliado: true,
+    substituiu: !!achadas[0],
+    media: media.media,
+    total: media.total
+  });
+};
+
+/* O que este aluno ja avaliou, para o leitor mostrar as estrelas dele. */
+
+rotas['POST /my-reviews'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  if (!idDono) return erro(res, 'owner em falta');
+
+  const minhas = (await bubbleTodos(T.avaliacao, [
+    restricao('Aluno', 'equals', idDono)
+  ], { maximo: 500 })).filter(function (a) { return !a['Is Deleted']; });
+
+  const saida = {};
+  minhas.forEach(function (a) {
+    saida[texto(a['Curso'])] = {
+      estrelas: numero(a['Estrelas']),
+      texto: texto(a['Texto'])
+    };
+  });
+
+  ok(res, { avaliacoes: saida });
 };
 
 /* ============================================================
