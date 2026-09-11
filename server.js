@@ -864,6 +864,46 @@ function agoraUid(idPessoa) {
   return n + 1;
 }
 
+/* Resume o estado do Agora sem revelar o certificado.
+   Fica na rota principal para se poder conferir num browser,
+   sem consola e sem chave nenhuma. */
+
+function estadoAgora() {
+  if (!AGORA_APP_ID && !AGORA_APP_CERT) return 'em falta (App ID e Certificate)';
+  if (!AGORA_APP_ID) return 'falta o AGORA_APP_ID';
+  if (!AGORA_APP_CERT) return 'falta o AGORA_APP_CERT';
+
+  if (AGORA_APP_ID.length !== 32) {
+    return 'AGORA_APP_ID com ' + AGORA_APP_ID.length + ' caracteres — devem ser 32';
+  }
+  if (AGORA_APP_CERT.length !== 32) {
+    return 'AGORA_APP_CERT com ' + AGORA_APP_CERT.length + ' caracteres — devem ser 32';
+  }
+  if (AGORA_APP_ID === AGORA_APP_CERT) {
+    return 'o App ID e o Certificate estao iguais — copiou duas vezes o mesmo';
+  }
+  if (!/^[0-9a-fA-F]{32}$/.test(AGORA_APP_ID) || !/^[0-9a-fA-F]{32}$/.test(AGORA_APP_CERT)) {
+    return 'valores fora do formato hexadecimal esperado';
+  }
+
+  /* Emite um token de teste e le-o de volta. Se o empacotamento
+     estiver torto, aparece aqui e nao so quando alguem tentar
+     entrar numa aula. */
+  try {
+    const emitido = agoraToken(AGORA_APP_ID, AGORA_APP_CERT, 'curc-teste', '1', [1], 600);
+    const lido = agoraLerToken(emitido.token);
+    const fecha = lido.versao === '007' &&
+      lido.app_id === AGORA_APP_ID &&
+      lido.assinatura_bytes === 32 &&
+      lido.sobrou === 0 &&
+      lido.servicos.length === 1 &&
+      lido.servicos[0].canal === 'curc-teste';
+    return fecha ? 'configurado e a emitir tokens' : 'o token nao fecha certo';
+  } catch (e) {
+    return 'rebentou a emitir: ' + e.message;
+  }
+}
+
 /* ============================================================
    5. REGRAS DE NEGOCIO
    ============================================================ */
@@ -1282,7 +1322,9 @@ rotas['GET /'] = async function (req, res) {
     stream: (STREAM_LIBRARY && STREAM_KEY && STREAM_CDN) ? 'configurado' : 'em falta',
     comissao_pct: COMISSAO_PCT,
     afiliado_min_pct: AFILIADO_MIN_PCT,
-    afiliado_max_pct: AFILIADO_MAX_PCT
+    afiliado_max_pct: AFILIADO_MAX_PCT,
+    levantamento_min: LEVANTAMENTO_MIN,
+    agora: estadoAgora()
   });
 };
 
@@ -4142,4 +4184,5 @@ servidor.listen(PORTA, function () {
   log('CDN:', CDN_HOST || '(nao configurado)');
   log('Stream:', STREAM_LIBRARY || '(nao configurado)');
   log('Comissao:', COMISSAO_PCT + '%');
+  log('Agora:', estadoAgora());
 });
