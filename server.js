@@ -2298,7 +2298,7 @@ rotas['POST /my-reviews'] = async function (req, res, corpo) {
    e mantem a mesma reparticao do M-Pesa: plataforma, afiliado
    e formador. */
 
-async function aplicarCompraCurso(idUtilizador, idCurso, valor, codigoRef, metodo, transacao) {
+async function aplicarCompraCurso(idUtilizador, idCurso, valor, codigoRef, metodo, transacao, telefone) {
   const aluno = await bubblePorId(T.user, idUtilizador);
   const curso = await bubblePorId(T.curso, idCurso);
   if (!aluno || !curso) throw new Error('utilizador ou curso desapareceu');
@@ -2312,6 +2312,7 @@ async function aplicarCompraCurso(idUtilizador, idCurso, valor, codigoRef, metod
   const idPagamento = await bubbleCriar(T.pagamento, {
     'User': idUtilizador,
     'Metodo': metodo || 'cartao',
+    'Telefone': texto(telefone),
     'Valor MZN': valor,
     'Item Type': 'curso',
     'Item Name': texto(curso['Titulo']),
@@ -2334,13 +2335,14 @@ async function aplicarCompraCurso(idUtilizador, idCurso, valor, codigoRef, metod
   return { pagamento: idPagamento, inscricao: idInscricao };
 }
 
-async function aplicarCompraPlano(idUtilizador, idPlano, valor, transacao) {
+async function aplicarCompraPlano(idUtilizador, idPlano, valor, transacao, metodo, telefone) {
   const plano = await bubblePorId(T.planoFormador, idPlano);
   if (!plano) throw new Error('plano desapareceu');
 
   const idPagamento = await bubbleCriar(T.pagamento, {
     'User': idUtilizador,
-    'Metodo': 'cartao',
+    'Metodo': metodo || 'cartao',
+    'Telefone': texto(telefone),
     'Valor MZN': valor,
     'Item Type': 'plano',
     'Item Name': texto(plano['Nome']),
@@ -2472,7 +2474,9 @@ rotas['POST /payment-status'] = async function (req, res, corpo) {
     valor: numero(p['Valor MZN']),
     item: texto(p['Item Nome']),
     item_type: texto(p['Item Type']),
-    item_id: texto(p['Item ID'])
+    item_id: texto(p['Item ID']),
+    forma: texto(p['Forma']),
+    nota: texto(p['Nota'])
   });
 };
 
@@ -2490,8 +2494,14 @@ rotas['POST /' + CARD_HOOK] = async function (req, res, corpo) {
   const valorDito = numero(corpo.amount || corpo.valor);
   const transacao = texto(corpo.transaction_id || corpo.payment_id);
 
+  /* A MoPayment manda mais coisas que valem a pena guardar:
+     o motivo da recusa, o tipo de cartao e o telefone. */
+  const motivo = texto(corpo.reason).slice(0, 300);
+  const forma = texto(corpo.payment_method);
+  const telefone = texto(corpo.phone);
+
   log('Webhook de cartao', ref || '(sem ref)',
-      evento || '(sem evento)', estado || '(sem estado)', valorDito);
+      estado || '(sem estado)', valorDito, forma || '');
 
   /* A MoPayment manda o resultado em dois sitios: o evento
      (payment.completed) e o estado (PAID). Nem sempre vem os
@@ -2531,9 +2541,10 @@ rotas['POST /' + CARD_HOOK] = async function (req, res, corpo) {
     if (falhou) {
       await bubbleActualizar(T.cartaoPendente, p._id, {
         'Estado': /expired/.test(evento) || estado === 'EXPIRED' ? 'Expirou' : 'Falhou',
-        'Nota': 'Webhook: ' + (evento || estado || 'sem indicacao')
+        'Nota': (estado || evento || 'sem indicacao') + (motivo ? ' — ' + motivo : ''),
+        'Forma': forma
       });
-      return ok(res, { recebido: true, aplicado: false, motivo: 'pagamento nao concluido' });
+      return ok(res, { recebido: true, aplicado: false, motivo: motivo || 'pagamento nao concluido' });
     }
 
     log('Webhook nao reconhecido para', ref, '— fica pendente:', JSON.stringify(corpo).slice(0, 300));
@@ -2557,18 +2568,24 @@ rotas['POST /' + CARD_HOOK] = async function (req, res, corpo) {
     const idUtilizador = texto(p['Utilizador']);
     let resultado;
 
+    const comoPagou = forma ? 'cartao · ' + forma : 'cartao';
+
     if (texto(p['Item Type']) === 'plano') {
-      resultado = await aplicarCompraPlano(idUtilizador, texto(p['Item ID']), esperado, transacao);
+      resultado = await aplicarCompraPlano(
+        idUtilizador, texto(p['Item ID']), esperado, transacao, comoPagou, telefone
+      );
     } else {
       resultado = await aplicarCompraCurso(
         idUtilizador, texto(p['Item ID']), esperado,
-        texto(p['Ref Afiliado']), 'cartao', transacao
+        texto(p['Ref Afiliado']), comoPagou, transacao, telefone
       );
     }
 
     await bubbleActualizar(T.cartaoPendente, p._id, {
       'Estado': 'Pago',
       'Transaction': transacao,
+      'Forma': forma,
+      'Telefone': telefone,
       'Aplicado Data': agora()
     });
 
