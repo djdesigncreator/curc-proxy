@@ -1,9 +1,24 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-10
+   versao: curc-12
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - pagamento por Visa e Mastercard pela MoPayment
+     - a MoPayment passou a exigir login: email e senha trocados
+       por um token Bearer, que fica em cache ate expirar
+     - o webhook_url vai no corpo do pedido — deixou de ser
+       preciso adivinhar se eles chamam o endereco
+     - POST /pay-card       gera o link de checkout
+     - POST /payment-status consulta pela referencia
+     - POST /<CARD_HOOK>    recebe o webhook e aplica a compra
+
+   Da versao curc-11:
+     - POST /live-hand   o aluno pede a palavra
+     - POST /live-state  o estado da sala: maos no ar, quem tem
+       voz, e se a aula ainda decorre
+
+   Da versao curc-10:
      - aulas ao vivo pelo Agora, em modo de transmissao:
        o formador publica, os alunos veem, e ele pode dar
        voz a um aluno de cada vez
@@ -77,7 +92,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-10';
+const VERSAO = 'curc-12';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -132,6 +147,15 @@ const LEVANTAMENTO_MIN = Number(limparValor(process.env.LEVANTAMENTO_MIN) || 500
 const AGORA_APP_ID = limparValor(process.env.AGORA_APP_ID);
 const AGORA_APP_CERT = limparValor(process.env.AGORA_APP_CERT);
 const AGORA_HORAS = Number(limparValor(process.env.AGORA_HORAS) || 4);
+
+/* Cartao pela MoPayment. O login devolve um token Bearer que
+   e preciso para o checkout. Sem assinatura no webhook, a
+   proteccao e o endereco secreto mais a conferencia da
+   referencia e do valor. */
+const MOPAY_EMAIL = limparValor(process.env.MOPAY_EMAIL);
+const MOPAY_SENHA = limparValor(process.env.MOPAY_SENHA);
+const CARD_HOOK = limparValor(process.env.CARD_HOOK) || 'wh-card-x9k2mq7p';
+const SELF_URL = limparUrl(process.env.SELF_URL);
 
 const RESEND_KEY = limparValor(process.env.RESEND_KEY);
 const MAIL_FROM = limparValor(process.env.MAIL_FROM) || 'CURC <noreply@curc.co.mz>';
@@ -480,6 +504,105 @@ function moldeLevantamento(nome, pedido, estado, nota) {
     </p>
   </div>
 </div>`;
+}
+
+/* ============================================================
+   4A. MOPAYMENT — CARTAO (VISA E MASTERCARD)
+   ============================================================ */
+
+/* A MoPayment passou a exigir login. O token vive em memoria
+   ate faltar pouco para expirar — nao vale a pena pedir um
+   novo a cada compra. */
+
+let cartaoSessao = { token: '', expira: 0 };
+
+function lerTokenLogin(dados) {
+  if (!dados || typeof dados !== 'object') return '';
+  const dentro = (dados.response && typeof dados.response === 'object') ? dados.response : {};
+
+  const candidatos = [
+    dados.token, dados.access_token, dados.jwt, dados.bearer,
+    dentro.token, dentro.access_token, dentro.jwt, dentro.bearer
+  ];
+
+  for (const v of candidatos) {
+    const t = texto(v);
+    if (t) return t;
+  }
+  return '';
+}
+
+async function cartaoEntrar(forcar) {
+  if (!MOPAY_EMAIL || !MOPAY_SENHA) {
+    throw new Error('MOPAY_EMAIL ou MOPAY_SENHA em falta no container');
+  }
+
+  /* Meio minuto de folga, para nao apanhar o token a expirar
+     no meio de um checkout. */
+  if (!forcar && cartaoSessao.token && cartaoSessao.expira > Date.now() + 30000) {
+    return cartaoSessao.token;
+  }
+
+  const resposta = await buscar(MOPAY_BASE + '/login', {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({ email: MOPAY_EMAIL, senha: MOPAY_SENHA })
+  }, 'MoPayment login');
+
+  const bruto = await resposta.text();
+  let dados = null;
+  try { dados = JSON.parse(bruto); } catch (e) { dados = null; }
+
+  const token = lerTokenLogin(dados);
+  if (!token) {
+    throw new Error('a MoPayment nao devolveu token no login: ' + bruto.slice(0, 200));
+  }
+
+  /* Eles nao dizem a validade. Uma hora e conservador. */
+  cartaoSessao = { token: token, expira: Date.now() + 60 * 60 * 1000 };
+  log('MoPayment: token de login renovado');
+
+  return token;
+}
+
+/* Pede o link de checkout. Se o token tiver morrido entretanto,
+   volta a entrar uma vez e tenta de novo. */
+
+async function cartaoCheckout(pedido, segundaTentativa) {
+  const token = await cartaoEntrar(!!segundaTentativa);
+
+  const resposta = await buscar(MOPAY_BASE + '/bankpayment', {
+    method: 'POST',
+    headers: {
+      'Content-Type': 'application/json',
+      'Authorization': 'Bearer ' + token
+    },
+    body: JSON.stringify(pedido)
+  }, 'MoPayment cartao');
+
+  const bruto = await resposta.text();
+  let dados = null;
+  try { dados = JSON.parse(bruto); } catch (e) { dados = null; }
+
+  const dentro = (dados && dados.response && typeof dados.response === 'object') ? dados.response : {};
+
+  const link = texto(
+    (dados && (dados.url || dados.link || dados.checkout_url || dados.redirect_url)) ||
+    dentro.url || dentro.link || dentro.checkout_url || dentro.redirect_url
+  );
+
+  if (link) return { link: link, bruto: bruto.slice(0, 1500) };
+
+  /* Token recusado: uma segunda tentativa com login novo. */
+  const pareceAuth = resposta.status === 401 || resposta.status === 403 ||
+    /token|autoriza|unauthor/i.test(bruto);
+
+  if (pareceAuth && !segundaTentativa) {
+    cartaoSessao = { token: '', expira: 0 };
+    return cartaoCheckout(pedido, true);
+  }
+
+  throw new Error('a MoPayment nao devolveu link de checkout: ' + bruto.slice(0, 250));
 }
 
 /* ============================================================
@@ -1324,7 +1447,10 @@ rotas['GET /'] = async function (req, res) {
     afiliado_min_pct: AFILIADO_MIN_PCT,
     afiliado_max_pct: AFILIADO_MAX_PCT,
     levantamento_min: LEVANTAMENTO_MIN,
-    agora: estadoAgora()
+    agora: estadoAgora(),
+    cartao: (MOPAY_EMAIL && MOPAY_SENHA)
+      ? (SELF_URL ? 'configurado · webhook em /' + CARD_HOOK : 'falta o SELF_URL')
+      : 'em falta (MOPAY_EMAIL e MOPAY_SENHA)'
   });
 };
 
@@ -2165,6 +2291,301 @@ rotas['POST /my-reviews'] = async function (req, res, corpo) {
 };
 
 /* ============================================================
+   6G. PAGAMENTO POR CARTAO
+   ============================================================ */
+
+/* Aplica uma compra que ja foi paga. Serve o webhook do cartao
+   e mantem a mesma reparticao do M-Pesa: plataforma, afiliado
+   e formador. */
+
+async function aplicarCompraCurso(idUtilizador, idCurso, valor, codigoRef, metodo, transacao) {
+  const aluno = await bubblePorId(T.user, idUtilizador);
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!aluno || !curso) throw new Error('utilizador ou curso desapareceu');
+
+  let afiliado = await afiliadoPorCodigo(codigoRef);
+  if (afiliado && !afiliadoVale(afiliado, curso, idUtilizador)) afiliado = null;
+
+  const pctAfiliado = afiliado ? comissaoAfiliadoDe(curso) : 0;
+  const reparticao = repartir(valor, pctAfiliado);
+
+  const idPagamento = await bubbleCriar(T.pagamento, {
+    'User': idUtilizador,
+    'Metodo': metodo || 'cartao',
+    'Valor MZN': valor,
+    'Item Type': 'curso',
+    'Item Name': texto(curso['Titulo']),
+    'Item ID': idCurso,
+    'Estado': 'Pago',
+    'Transaction': texto(transacao),
+    'Message': 'Pagamento por cartao',
+    'Formador': texto(curso['Formador']),
+    'Comissao MZN': reparticao.comissao,
+    'Liquido MZN': reparticao.liquido,
+    'Afiliado': afiliado ? texto(afiliado['Utilizador']) : '',
+    'Afiliado MZN': reparticao.afiliado,
+    'Ref Codigo': afiliado ? texto(afiliado['Codigo']) : ''
+  });
+
+  const idInscricao = await criarInscricao(aluno, curso, 'compra', valor);
+  await creditarFormador(texto(curso['Formador']), reparticao.liquido);
+  if (afiliado) await creditarAfiliado(afiliado, reparticao.afiliado);
+
+  return { pagamento: idPagamento, inscricao: idInscricao };
+}
+
+async function aplicarCompraPlano(idUtilizador, idPlano, valor, transacao) {
+  const plano = await bubblePorId(T.planoFormador, idPlano);
+  if (!plano) throw new Error('plano desapareceu');
+
+  const idPagamento = await bubbleCriar(T.pagamento, {
+    'User': idUtilizador,
+    'Metodo': 'cartao',
+    'Valor MZN': valor,
+    'Item Type': 'plano',
+    'Item Name': texto(plano['Nome']),
+    'Item ID': idPlano,
+    'Estado': 'Pago',
+    'Transaction': texto(transacao),
+    'Message': 'Adesao por cartao',
+    'Comissao MZN': valor,
+    'Liquido MZN': 0
+  });
+
+  await bubbleActualizar(T.user, idUtilizador, {
+    'Plano Formador': idPlano,
+    'Plano Desde': agora()
+  });
+
+  return { pagamento: idPagamento };
+}
+
+/* ---------- iniciar ---------- */
+
+rotas['POST /pay-card'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const tipo = texto(corpo.item_type) || 'curso';
+  const idItem = texto(corpo.item_id);
+
+  if (!idDono || !idItem) return erro(res, 'owner ou item_id em falta');
+  if (tipo !== 'curso' && tipo !== 'plano') return erro(res, 'item_type deve ser curso ou plano');
+  if (!SELF_URL) return erro(res, 'SELF_URL em falta no container');
+  if (!APP_URL) return erro(res, 'APP_URL em falta no container');
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+
+  let valor = 0;
+  let nomeItem = '';
+
+  if (tipo === 'curso') {
+    const curso = await bubblePorId(T.curso, idItem);
+    if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+    if (texto(curso['Estado']) !== 'Publicado') return erro(res, 'curso nao disponivel', 403);
+    if (texto(curso['Formador']) === idDono) return erro(res, 'este curso e seu');
+
+    const jaTem = await inscricaoDe(idDono, idItem);
+    if (jaTem && jaTem['Is Active']) return erro(res, 'ja tem acesso a este curso');
+
+    valor = precoEfectivo(curso);
+    if (valor <= 0) return erro(res, 'este curso e gratis — use /enroll');
+    nomeItem = texto(curso['Titulo']);
+  } else {
+    const plano = await bubblePorId(T.planoFormador, idItem);
+    if (!plano || !plano['Is Active']) return erro(res, 'plano nao disponivel', 404);
+    if (texto(utilizador['Plano Formador']) === idItem) return erro(res, 'ja esta neste plano');
+
+    const cursos = await cursosVivosDe(idDono);
+    const maxNovo = numero(plano['Max Cursos']);
+    if (maxNovo > 0 && cursos.length > maxNovo) {
+      return erro(res, 'tem ' + cursos.length + ' cursos e este plano so permite ' + maxNovo);
+    }
+
+    valor = numero(plano['Preco MZN']);
+    if (valor <= 0) return erro(res, 'este plano e gratuito — use /pay-plan');
+    nomeItem = 'Plano ' + texto(plano['Nome']);
+  }
+
+  const ref = referencia('CURC');
+
+  /* A referencia e criada por nos antes de falar com a MoPayment.
+     O webhook so aceita referencias que nos proprios criamos. */
+  const idPendente = await bubbleCriar(T.cartaoPendente, {
+    'Utilizador': idDono,
+    'Item Type': tipo,
+    'Item ID': idItem,
+    'Item Nome': nomeItem,
+    'Valor MZN': valor,
+    'Referencia': ref,
+    'Estado': 'Pendente',
+    'Ref Afiliado': texto(corpo.ref).toUpperCase()
+  });
+
+  const voltar = APP_URL + '?ref=' + encodeURIComponent(ref);
+
+  let saida;
+  try {
+    saida = await cartaoCheckout({
+      valor: String(Math.round(valor)),
+      nome_cliente: texto(utilizador['Nome Completo']) || 'Cliente CURC',
+      carteira: MOZ_WALLET,
+      return_url: voltar,
+      nome_producto: nomeItem,
+      webhook_url: SELF_URL + '/' + CARD_HOOK
+    });
+  } catch (e) {
+    await bubbleActualizar(T.cartaoPendente, idPendente, {
+      'Estado': 'Falhou',
+      'Nota': e.message.slice(0, 400)
+    });
+    return erro(res, e.message);
+  }
+
+  log('Checkout de cartao criado', ref, valor, 'MZN');
+
+  ok(res, {
+    referencia: ref,
+    valor: valor,
+    item: nomeItem,
+    checkout: saida.link,
+    voltar: voltar
+  });
+};
+
+/* A pagina de regresso pergunta por aqui se ja chegou o webhook. */
+
+rotas['POST /payment-status'] = async function (req, res, corpo) {
+  const ref = texto(corpo.referencia);
+  if (!ref) return erro(res, 'referencia em falta');
+
+  const achados = await bubbleTodos(T.cartaoPendente, [
+    restricao('Referencia', 'equals', ref)
+  ], { maximo: 1 });
+
+  const p = achados[0];
+  if (!p) return erro(res, 'referencia nao encontrada', 404);
+
+  ok(res, {
+    referencia: ref,
+    estado: texto(p['Estado']) || 'Pendente',
+    pago: texto(p['Estado']) === 'Pago',
+    valor: numero(p['Valor MZN']),
+    item: texto(p['Item Nome']),
+    item_type: texto(p['Item Type']),
+    item_id: texto(p['Item ID'])
+  });
+};
+
+/* ---------- webhook ---------- */
+
+/* A MoPayment nao assina o webhook. A proteccao e tripla: o
+   endereco e secreto, a referencia tem de ser uma que nos
+   criamos, e o valor tem de bater certo. Uma referencia ja
+   aplicada nunca e aplicada outra vez. */
+
+rotas['POST /' + CARD_HOOK] = async function (req, res, corpo) {
+  const ref = texto(corpo.reference || corpo.referencia);
+  const evento = texto(corpo.event || corpo.evento).toLowerCase();
+  const estado = texto(corpo.status || corpo.estado).toUpperCase();
+  const valorDito = numero(corpo.amount || corpo.valor);
+  const transacao = texto(corpo.transaction_id || corpo.payment_id);
+
+  log('Webhook de cartao', ref || '(sem ref)',
+      evento || '(sem evento)', estado || '(sem estado)', valorDito);
+
+  /* A MoPayment manda o resultado em dois sitios: o evento
+     (payment.completed) e o estado (PAID). Nem sempre vem os
+     dois — basta um deles dizer que esta pago. */
+
+  const pagou =
+    /completed|succeeded|success|paid/.test(evento) ||
+    ['PAID', 'COMPLETED', 'SUCCESS', 'SUCCEEDED'].indexOf(estado) !== -1;
+
+  const falhou =
+    /failed|cancel|expired|declin/.test(evento) ||
+    ['FAILED', 'EXPIRED', 'CANCELLED', 'CANCELED', 'DECLINED'].indexOf(estado) !== -1;
+
+  /* Responder sempre 200: um webhook que falha e repetido
+     para sempre, e nao queremos isso por uma referencia velha. */
+  if (!ref) return ok(res, { recebido: true, aplicado: false, motivo: 'sem referencia' });
+
+  const achados = await bubbleTodos(T.cartaoPendente, [
+    restricao('Referencia', 'equals', ref)
+  ], { maximo: 1 });
+
+  const p = achados[0];
+  if (!p) {
+    log('Webhook com referencia desconhecida:', ref);
+    return ok(res, { recebido: true, aplicado: false, motivo: 'referencia desconhecida' });
+  }
+
+  if (texto(p['Estado']) === 'Pago') {
+    return ok(res, { recebido: true, aplicado: false, motivo: 'ja tinha sido aplicado' });
+  }
+
+  if (!pagou) {
+    /* So marca como falhado quando a MoPayment diz mesmo que
+       falhou. Um webhook que nao percebemos deixa a referencia
+       pendente — assim um aviso correcto que venha a seguir
+       ainda consegue aplicar a compra. */
+    if (falhou) {
+      await bubbleActualizar(T.cartaoPendente, p._id, {
+        'Estado': /expired/.test(evento) || estado === 'EXPIRED' ? 'Expirou' : 'Falhou',
+        'Nota': 'Webhook: ' + (evento || estado || 'sem indicacao')
+      });
+      return ok(res, { recebido: true, aplicado: false, motivo: 'pagamento nao concluido' });
+    }
+
+    log('Webhook nao reconhecido para', ref, '— fica pendente:', JSON.stringify(corpo).slice(0, 300));
+    await bubbleActualizar(T.cartaoPendente, p._id, {
+      'Nota': 'Aviso nao reconhecido: ' + (evento || estado || '?')
+    });
+    return ok(res, { recebido: true, aplicado: false, motivo: 'aviso nao reconhecido' });
+  }
+
+  const esperado = numero(p['Valor MZN']);
+  if (valorDito > 0 && Math.abs(valorDito - esperado) > 1) {
+    log('Webhook com valor errado:', ref, 'dito', valorDito, 'esperado', esperado);
+    await bubbleActualizar(T.cartaoPendente, p._id, {
+      'Estado': 'Suspeito',
+      'Nota': 'Valor recebido ' + valorDito + ', esperado ' + esperado
+    });
+    return ok(res, { recebido: true, aplicado: false, motivo: 'valor nao bate certo' });
+  }
+
+  try {
+    const idUtilizador = texto(p['Utilizador']);
+    let resultado;
+
+    if (texto(p['Item Type']) === 'plano') {
+      resultado = await aplicarCompraPlano(idUtilizador, texto(p['Item ID']), esperado, transacao);
+    } else {
+      resultado = await aplicarCompraCurso(
+        idUtilizador, texto(p['Item ID']), esperado,
+        texto(p['Ref Afiliado']), 'cartao', transacao
+      );
+    }
+
+    await bubbleActualizar(T.cartaoPendente, p._id, {
+      'Estado': 'Pago',
+      'Transaction': transacao,
+      'Aplicado Data': agora()
+    });
+
+    log('Cartao aplicado', ref, esperado, 'MZN —', texto(p['Item Nome']));
+
+    ok(res, { recebido: true, aplicado: true, pagamento: resultado.pagamento });
+  } catch (e) {
+    log('Falhou aplicar o cartao', ref, '—', e.message);
+    await bubbleActualizar(T.cartaoPendente, p._id, {
+      'Estado': 'Erro',
+      'Nota': e.message.slice(0, 400)
+    });
+    ok(res, { recebido: true, aplicado: false, motivo: e.message });
+  }
+};
+
+/* ============================================================
    6F. AULAS AO VIVO
    ============================================================ */
 
@@ -2295,7 +2716,10 @@ rotas['POST /live-start'] = async function (req, res, corpo) {
   await bubbleActualizar(T.live, idLive, {
     'Estado': 'Ao Vivo',
     'Canal': canal,
-    'Inicio Real': agora()
+    'Inicio Real': agora(),
+    'Com Voz': '',
+    'Maos': [],
+    'Total Espectadores': 0
   });
 
   const uid = agoraUid(idDono);
@@ -2333,7 +2757,9 @@ rotas['POST /live-end'] = async function (req, res, corpo) {
   await bubbleActualizar(T.live, idLive, {
     'Estado': 'Terminada',
     'Fim': agora(),
-    'Duracao Segundos': duracao
+    'Duracao Segundos': duracao,
+    'Com Voz': '',
+    'Maos': []
   });
 
   ok(res, { terminada: true, duracao: duracao });
@@ -2404,10 +2830,119 @@ rotas['POST /live-voz'] = async function (req, res, corpo) {
 
   await cursoDoFormador(idDono, texto(live['Curso']));
 
-  /* Aluno vazio tira a voz a quem a tinha. */
-  await bubbleActualizar(T.live, idLive, { 'Com Voz': idAluno });
+  /* Aluno vazio tira a voz a quem a tinha.
+     Quem recebe voz deixa de ter a mao no ar — ja foi atendido. */
+  const maos = Array.isArray(live['Maos']) ? live['Maos'].map(texto).filter(Boolean) : [];
+  const campos = { 'Com Voz': idAluno };
+  if (idAluno) campos['Maos'] = maos.filter(function (m) { return m !== idAluno; });
+
+  await bubbleActualizar(T.live, idLive, campos);
 
   ok(res, { com_voz: idAluno, uid: idAluno ? agoraUid(idAluno) : 0 });
+};
+
+/* ---------- pedir a palavra ---------- */
+
+/* O aluno levanta a mao; o formador ve a lista e da voz a um.
+   So o formador consulta em ciclo, por isso nao ha cinquenta
+   pessoas a bater no Bubble ao mesmo tempo. */
+
+rotas['POST /live-hand'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+  const levantar = corpo.levantar !== false;
+
+  if (!idDono || !idLive) return erro(res, 'owner ou live em falta');
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+  if (texto(live['Estado']) !== 'Ao Vivo') return erro(res, 'esta aula nao esta a decorrer');
+
+  const curso = await bubblePorId(T.curso, texto(live['Curso']));
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  try {
+    await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  const maos = Array.isArray(live['Maos']) ? live['Maos'].map(texto).filter(Boolean) : [];
+  const jaEsta = maos.indexOf(idDono) !== -1;
+
+  let novas = maos;
+  if (levantar && !jaEsta) novas = maos.concat([idDono]);
+  if (!levantar && jaEsta) novas = maos.filter(function (m) { return m !== idDono; });
+
+  if (novas !== maos) {
+    await bubbleActualizar(T.live, idLive, { 'Maos': novas });
+  }
+
+  ok(res, { no_ar: levantar && novas.indexOf(idDono) !== -1, quantas: novas.length });
+};
+
+/* O estado da sala. O formador recebe a lista de quem pediu a
+   palavra; o aluno recebe apenas o que lhe diz respeito. */
+
+rotas['POST /live-state'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+  if (!idLive) return erro(res, 'live em falta');
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  const curso = await bubblePorId(T.curso, texto(live['Curso']));
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  const eDono = texto(curso['Formador']) === idDono;
+
+  if (!eDono) {
+    try {
+      await acessoAoCurso(idDono, curso);
+    } catch (e) {
+      return erro(res, e.message, 403);
+    }
+  }
+
+  const comVoz = texto(live['Com Voz']);
+  const maos = Array.isArray(live['Maos']) ? live['Maos'].map(texto).filter(Boolean) : [];
+
+  const base = {
+    estado: texto(live['Estado']) || 'Agendada',
+    ao_vivo: texto(live['Estado']) === 'Ao Vivo',
+    espectadores: numero(live['Total Espectadores']),
+    tenho_voz: !!(comVoz && comVoz === idDono),
+    minha_mao: maos.indexOf(idDono) !== -1,
+    voz_uid: comVoz ? agoraUid(comVoz) : 0
+  };
+
+  if (!eDono) return ok(res, base);
+
+  /* Nomes so para o formador — o aluno nao precisa de saber
+     quem mais esta na sala. */
+  const pedidos = [];
+  for (const id of maos.slice(0, 30)) {
+    const p = await bubblePorId(T.user, id);
+    pedidos.push({
+      id: id,
+      nome: p ? texto(p['Nome Completo']) : 'Alguém',
+      foto: p ? texto(p['Foto URL']) : '',
+      uid: agoraUid(id)
+    });
+  }
+
+  const quemFala = comVoz ? await bubblePorId(T.user, comVoz) : null;
+
+  ok(res, Object.assign(base, {
+    e_dono: true,
+    maos: pedidos,
+    com_voz: comVoz ? {
+      id: comVoz,
+      nome: quemFala ? texto(quemFala['Nome Completo']) : 'Alguém',
+      uid: agoraUid(comVoz)
+    } : null
+  }));
 };
 
 /* ---------- diagnostico ---------- */
