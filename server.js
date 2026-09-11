@@ -1,9 +1,19 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-9
+   versao: curc-10
    Plataforma EAD marketplace para o mercado mocambicano.
 
    Novidades desta versao:
+     - aulas ao vivo pelo Agora, em modo de transmissao:
+       o formador publica, os alunos veem, e ele pode dar
+       voz a um aluno de cada vez
+     - construtor de tokens AccessToken2 escrito a mao, para o
+       container continuar sem dependencias
+     - POST /live-save /live-delete /lives
+     - POST /live-start /live-end /live-join /live-voz
+     - POST /diag-agora  descodifica um token para conferencia
+
+   Da versao curc-9:
      - levantamentos. O formador e o afiliado pedem o dinheiro,
        o valor sai do saldo na hora, e volta se for recusado.
      - POST /payout-request  pedir o levantamento
@@ -67,7 +77,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-9';
+const VERSAO = 'curc-10';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -117,6 +127,11 @@ const AFILIADO_MAX_PCT = Number(limparValor(process.env.AFILIADO_MAX_PCT) || 50)
 /* Levantamentos. Abaixo do minimo nao compensa a nenhuma das
    partes — a taxa da carteira come a transferencia. */
 const LEVANTAMENTO_MIN = Number(limparValor(process.env.LEVANTAMENTO_MIN) || 500);
+
+/* Agora — aulas ao vivo. O certificado nunca sai do container. */
+const AGORA_APP_ID = limparValor(process.env.AGORA_APP_ID);
+const AGORA_APP_CERT = limparValor(process.env.AGORA_APP_CERT);
+const AGORA_HORAS = Number(limparValor(process.env.AGORA_HORAS) || 4);
 
 const RESEND_KEY = limparValor(process.env.RESEND_KEY);
 const MAIL_FROM = limparValor(process.env.MAIL_FROM) || 'CURC <noreply@curc.co.mz>';
@@ -676,6 +691,178 @@ const IMAGENS_ACEITES = {
   'image/png': 'png',
   'image/webp': 'webp'
 };
+
+/* ============================================================
+   4C. AGORA — TOKENS DE AULA AO VIVO
+   ============================================================ */
+
+/* O Agora exige um token assinado com o App Certificate, que nunca
+   pode chegar ao browser. O formato AccessToken2 e uma estrutura
+   binaria empacotada em little-endian, comprimida com zlib e
+   passada a base64, com "007" a frente.
+
+   Implementado a mao para o container nao ganhar dependencias.
+   A rota /diag-agora descodifica um token de volta, para se
+   confirmar que o empacotamento esta certo. */
+
+const zlib = require('zlib');
+
+const AGORA_VERSAO = '007';
+const AGORA_SERVICO_RTC = 1;
+
+/* Privilegios do servico RTC. */
+const AGORA_ENTRAR = 1;
+const AGORA_PUBLICAR_AUDIO = 2;
+const AGORA_PUBLICAR_VIDEO = 3;
+const AGORA_PUBLICAR_DADOS = 4;
+
+function agoraUint16(valor) {
+  const b = Buffer.alloc(2);
+  b.writeUInt16LE(valor >>> 0, 0);
+  return b;
+}
+
+function agoraUint32(valor) {
+  const b = Buffer.alloc(4);
+  b.writeUInt32LE(valor >>> 0, 0);
+  return b;
+}
+
+/* Aceita texto ou bytes. A assinatura vem em Buffer, e passa-la
+   por String() corrompia-a — 32 bytes binarios viravam 52 de
+   UTF-8. Foi o descodificador que apanhou isto. */
+
+function agoraString(valor) {
+  const bytes = Buffer.isBuffer(valor)
+    ? valor
+    : Buffer.from(valor === null || valor === undefined ? '' : String(valor), 'utf8');
+  return Buffer.concat([agoraUint16(bytes.length), bytes]);
+}
+
+function agoraMapa(privilegios) {
+  const chaves = Object.keys(privilegios).map(Number).sort(function (a, b) { return a - b; });
+  let saida = agoraUint16(chaves.length);
+  chaves.forEach(function (k) {
+    saida = Buffer.concat([saida, agoraUint16(k), agoraUint32(privilegios[k])]);
+  });
+  return saida;
+}
+
+/* Empacota o servico RTC: tipo, privilegios, canal e utilizador. */
+
+function agoraServicoRtc(canal, uid, privilegios) {
+  return Buffer.concat([
+    agoraUint16(AGORA_SERVICO_RTC),
+    agoraMapa(privilegios),
+    agoraString(canal),
+    agoraString(uid)
+  ]);
+}
+
+/* A assinatura e feita em dois passos: primeiro sobre o certificado
+   com a hora de emissao, depois sobre o resultado com o sal. */
+
+function agoraAssinar(certificado, emissao, sal) {
+  const passo1 = crypto.createHmac('sha256', agoraUint32(emissao))
+    .update(Buffer.from(certificado, 'utf8')).digest();
+  return crypto.createHmac('sha256', agoraUint32(sal)).update(passo1).digest();
+}
+
+function agoraToken(appId, certificado, canal, uid, privilegios, segundos) {
+  if (!appId || !certificado) {
+    throw new Error('Agora nao esta configurado no container');
+  }
+
+  const emissao = Math.floor(Date.now() / 1000);
+  const validade = emissao + Math.max(60, segundos || 3600);
+  const sal = crypto.randomBytes(4).readUInt32LE(0) % 99999999 + 1;
+
+  /* Cada privilegio expira na sua hora — aqui todos ao mesmo tempo. */
+  const mapa = {};
+  privilegios.forEach(function (p) { mapa[p] = validade; });
+
+  const corpo = Buffer.concat([
+    agoraString(appId),
+    agoraUint32(emissao),
+    agoraUint32(validade),
+    agoraUint32(sal),
+    agoraUint16(1),
+    agoraServicoRtc(canal, uid, mapa)
+  ]);
+
+  const assinatura = crypto.createHmac('sha256', agoraAssinar(certificado, emissao, sal))
+    .update(corpo).digest();
+
+  const conteudo = Buffer.concat([agoraString(assinatura), corpo]);
+
+  return {
+    token: AGORA_VERSAO + zlib.deflateSync(conteudo).toString('base64'),
+    emissao: emissao,
+    validade: validade
+  };
+}
+
+/* Le um token de volta. So serve para diagnostico — confirma que
+   o que empacotamos e o que julgamos ter empacotado. */
+
+function agoraLerToken(token) {
+  const versao = token.slice(0, 3);
+  const cru = zlib.inflateSync(Buffer.from(token.slice(3), 'base64'));
+
+  let i = 0;
+  function lerString() {
+    const n = cru.readUInt16LE(i); i += 2;
+    const s = cru.slice(i, i + n); i += n;
+    return s;
+  }
+  function lerUint32() { const v = cru.readUInt32LE(i); i += 4; return v; }
+  function lerUint16() { const v = cru.readUInt16LE(i); i += 2; return v; }
+
+  const assinatura = lerString();
+  const appId = lerString().toString('utf8');
+  const emissao = lerUint32();
+  const validade = lerUint32();
+  const sal = lerUint32();
+  const quantos = lerUint16();
+
+  const servicos = [];
+  for (let s = 0; s < quantos; s++) {
+    const tipo = lerUint16();
+    const nPriv = lerUint16();
+    const privs = {};
+    for (let p = 0; p < nPriv; p++) {
+      const chave = lerUint16();
+      privs[chave] = lerUint32();
+    }
+    servicos.push({
+      tipo: tipo,
+      privilegios: privs,
+      canal: lerString().toString('utf8'),
+      uid: lerString().toString('utf8')
+    });
+  }
+
+  return {
+    versao: versao,
+    app_id: appId,
+    emissao: emissao,
+    validade: validade,
+    sal: sal,
+    assinatura_bytes: assinatura.length,
+    servicos: servicos,
+    sobrou: cru.length - i
+  };
+}
+
+/* O Agora precisa de um numero para identificar quem entra.
+   O id do Bubble e texto, por isso derivamos um numero estavel
+   dele — a mesma pessoa entra sempre com o mesmo uid. */
+
+function agoraUid(idPessoa) {
+  const soma = crypto.createHash('sha256').update(String(idPessoa)).digest();
+  const n = soma.readUInt32BE(0) % 2147483646;
+  return n + 1;
+}
 
 /* ============================================================
    5. REGRAS DE NEGOCIO
@@ -1933,6 +2120,302 @@ rotas['POST /my-reviews'] = async function (req, res, corpo) {
   });
 
   ok(res, { avaliacoes: saida });
+};
+
+/* ============================================================
+   6F. AULAS AO VIVO
+   ============================================================ */
+
+/* Modo de transmissao: so o formador publica. Um aluno de cada
+   vez pode receber voz, e nessa altura ganha o privilegio de
+   publicar. O token dele e refeito — nao se pode dar voz
+   apenas no browser, senao qualquer um se promovia sozinho. */
+
+function livePublica(l, agora_) {
+  return {
+    id: l._id,
+    titulo: texto(l['Titulo']),
+    canal: texto(l['Canal']),
+    estado: texto(l['Estado']) || 'Agendada',
+    inicio: l['Inicio'] || null,
+    fim: l['Fim'] || null,
+    duracao: numero(l['Duracao Segundos']),
+    espectadores: numero(l['Total Espectadores']),
+    ao_vivo: texto(l['Estado']) === 'Ao Vivo',
+    passou: !!(l['Inicio'] && new Date(l['Inicio']).getTime() < (agora_ || Date.now()))
+  };
+}
+
+rotas['POST /lives'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  if (!idCurso) return erro(res, 'curso em falta');
+
+  const curso = await bubblePorId(T.curso, idCurso);
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  const eDono = idDono && texto(curso['Formador']) === idDono;
+
+  if (!eDono) {
+    try {
+      await acessoAoCurso(idDono, curso);
+    } catch (e) {
+      return erro(res, e.message, 403);
+    }
+  }
+
+  const lista = (await bubbleTodos(T.live, [
+    restricao('Curso', 'equals', idCurso)
+  ], { maximo: 200 })).filter(function (l) { return !l['Is Deleted']; });
+
+  lista.sort(function (a, b) {
+    return new Date(b['Inicio'] || 0) - new Date(a['Inicio'] || 0);
+  });
+
+  ok(res, {
+    e_dono: !!eDono,
+    agora_configurado: !!(AGORA_APP_ID && AGORA_APP_CERT),
+    lives: lista.map(function (l) { return livePublica(l); })
+  });
+};
+
+rotas['POST /live-save'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idLive = texto(corpo.live);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const titulo = texto(corpo.titulo).slice(0, 140);
+  if (!titulo) return erro(res, 'a aula ao vivo precisa de um titulo');
+
+  const campos = { 'Titulo': titulo };
+  if (texto(corpo.inicio)) campos['Inicio'] = texto(corpo.inicio);
+
+  if (idLive) {
+    const live = await bubblePorId(T.live, idLive);
+    if (!live || texto(live['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+    if (texto(live['Estado']) === 'Ao Vivo') {
+      return erro(res, 'nao pode editar uma aula que esta a decorrer');
+    }
+    await bubbleActualizar(T.live, idLive, campos);
+    return ok(res, { live: idLive, novo: false });
+  }
+
+  campos['Curso'] = idCurso;
+  campos['Formador'] = idDono;
+  campos['Estado'] = 'Agendada';
+  campos['Total Espectadores'] = 0;
+  campos['Duracao Segundos'] = 0;
+  campos['Is Deleted'] = false;
+
+  const novo = await bubbleCriar(T.live, campos);
+
+  /* O canal leva o id da aula. Fica unico sem esforco e nao
+     revela nada sobre o curso. */
+  const canal = 'curc-' + novo;
+  await bubbleActualizar(T.live, novo, { 'Canal': canal });
+
+  ok(res, { live: novo, novo: true, canal: canal });
+};
+
+rotas['POST /live-delete'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idCurso = texto(corpo.curso);
+  const idLive = texto(corpo.live);
+
+  await cursoDoFormador(idDono, idCurso);
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || texto(live['Curso']) !== idCurso) return erro(res, 'aula nao encontrada', 404);
+  if (texto(live['Estado']) === 'Ao Vivo') return erro(res, 'termine a aula antes de a apagar');
+
+  await bubbleActualizar(T.live, idLive, { 'Is Deleted': true });
+  ok(res, { apagado: true });
+};
+
+/* ---------- entrar ---------- */
+
+/* O formador abre a sala e recebe o token de quem publica. */
+
+rotas['POST /live-start'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+  if (!idLive) return erro(res, 'live em falta');
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  await cursoDoFormador(idDono, texto(live['Curso']));
+
+  const canal = texto(live['Canal']) || ('curc-' + idLive);
+
+  await bubbleActualizar(T.live, idLive, {
+    'Estado': 'Ao Vivo',
+    'Canal': canal,
+    'Inicio Real': agora()
+  });
+
+  const uid = agoraUid(idDono);
+  const emitido = agoraToken(
+    AGORA_APP_ID, AGORA_APP_CERT, canal, String(uid),
+    [AGORA_ENTRAR, AGORA_PUBLICAR_AUDIO, AGORA_PUBLICAR_VIDEO, AGORA_PUBLICAR_DADOS],
+    AGORA_HORAS * 3600
+  );
+
+  log('Aula ao vivo aberta', canal);
+
+  ok(res, {
+    app_id: AGORA_APP_ID,
+    canal: canal,
+    uid: uid,
+    token: emitido.token,
+    validade: emitido.validade,
+    papel: 'formador',
+    titulo: texto(live['Titulo'])
+  });
+};
+
+rotas['POST /live-end'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  await cursoDoFormador(idDono, texto(live['Curso']));
+
+  const comecou = live['Inicio Real'] ? new Date(live['Inicio Real']).getTime() : 0;
+  const duracao = comecou ? Math.round((Date.now() - comecou) / 1000) : 0;
+
+  await bubbleActualizar(T.live, idLive, {
+    'Estado': 'Terminada',
+    'Fim': agora(),
+    'Duracao Segundos': duracao
+  });
+
+  ok(res, { terminada: true, duracao: duracao });
+};
+
+/* O aluno entra a ver. Sem privilegio de publicar — o token
+   dele nao lhe permite ligar a camara mesmo que tente. */
+
+rotas['POST /live-join'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+  if (!idDono || !idLive) return erro(res, 'owner ou live em falta');
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+  if (texto(live['Estado']) !== 'Ao Vivo') return erro(res, 'esta aula nao esta a decorrer');
+
+  const curso = await bubblePorId(T.curso, texto(live['Curso']));
+  if (!curso || curso['Is Deleted']) return erro(res, 'curso nao encontrado', 404);
+
+  let direito;
+  try {
+    direito = await acessoAoCurso(idDono, curso);
+  } catch (e) {
+    return erro(res, e.message, 403);
+  }
+
+  const canal = texto(live['Canal']);
+  const uid = agoraUid(idDono);
+
+  /* Se o formador lhe deu voz, ganha os privilegios de publicar. */
+  const comVoz = texto(live['Com Voz']) === idDono;
+
+  const privilegios = direito.dono || comVoz
+    ? [AGORA_ENTRAR, AGORA_PUBLICAR_AUDIO, AGORA_PUBLICAR_VIDEO, AGORA_PUBLICAR_DADOS]
+    : [AGORA_ENTRAR];
+
+  const emitido = agoraToken(
+    AGORA_APP_ID, AGORA_APP_CERT, canal, String(uid),
+    privilegios, AGORA_HORAS * 3600
+  );
+
+  await bubbleActualizar(T.live, idLive, {
+    'Total Espectadores': numero(live['Total Espectadores']) + 1
+  });
+
+  ok(res, {
+    app_id: AGORA_APP_ID,
+    canal: canal,
+    uid: uid,
+    token: emitido.token,
+    validade: emitido.validade,
+    papel: (direito.dono || comVoz) ? 'orador' : 'espectador',
+    titulo: texto(live['Titulo'])
+  });
+};
+
+/* Dar ou tirar voz a um aluno. So o formador pode, e o aluno
+   tem de voltar a pedir o token para a voz valer. */
+
+rotas['POST /live-voz'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idLive = texto(corpo.live);
+  const idAluno = texto(corpo.aluno);
+
+  const live = await bubblePorId(T.live, idLive);
+  if (!live || live['Is Deleted']) return erro(res, 'aula nao encontrada', 404);
+
+  await cursoDoFormador(idDono, texto(live['Curso']));
+
+  /* Aluno vazio tira a voz a quem a tinha. */
+  await bubbleActualizar(T.live, idLive, { 'Com Voz': idAluno });
+
+  ok(res, { com_voz: idAluno, uid: idAluno ? agoraUid(idAluno) : 0 });
+};
+
+/* ---------- diagnostico ---------- */
+
+rotas['POST /diag-agora'] = async function (req, res, corpo) {
+  if (!UPLOAD_SECRET || texto(corpo.key) !== UPLOAD_SECRET) {
+    return erro(res, 'chave invalida', 403);
+  }
+
+  const relatorio = {
+    versao: VERSAO,
+    app_id: AGORA_APP_ID ? (AGORA_APP_ID.slice(0, 6) + '…' + AGORA_APP_ID.slice(-4)) : '(em falta)',
+    app_id_tamanho: AGORA_APP_ID.length,
+    certificado: AGORA_APP_CERT ? 'definido (' + AGORA_APP_CERT.length + ' caracteres)' : '(em falta)',
+    horas: AGORA_HORAS
+  };
+
+  if (!AGORA_APP_ID || !AGORA_APP_CERT) {
+    relatorio.aviso = 'Sem App ID ou App Certificate nao ha aulas ao vivo. ' +
+      'Ambos se obtem em console.agora.io, no projecto, com App Certificate activado.';
+    return ok(res, relatorio);
+  }
+
+  try {
+    const emitido = agoraToken(
+      AGORA_APP_ID, AGORA_APP_CERT, 'curc-teste', '12345',
+      [AGORA_ENTRAR, AGORA_PUBLICAR_AUDIO, AGORA_PUBLICAR_VIDEO], 3600
+    );
+
+    const lido = agoraLerToken(emitido.token);
+
+    relatorio.token_tamanho = emitido.token.length;
+    relatorio.comeca_por = emitido.token.slice(0, 3);
+    relatorio.descodificado = lido;
+    relatorio.conferido =
+      lido.versao === '007' &&
+      lido.app_id === AGORA_APP_ID &&
+      lido.assinatura_bytes === 32 &&
+      lido.sobrou === 0 &&
+      lido.servicos.length === 1 &&
+      lido.servicos[0].tipo === 1 &&
+      lido.servicos[0].canal === 'curc-teste' &&
+      lido.servicos[0].uid === '12345'
+        ? 'ok — o empacotamento fecha certo'
+        : 'ATENCAO — o token nao descodifica como esperado';
+  } catch (e) {
+    relatorio.erro = e.message;
+  }
+
+  ok(res, relatorio);
 };
 
 /* ============================================================
