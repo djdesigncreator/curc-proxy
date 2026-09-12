@@ -1,9 +1,23 @@
 /* ============================================================
    CURC — container proxy
-   versao: curc-12
-   Plataforma EAD marketplace para o mercado mocambicano.
+   versao: curc-13
+   Plataforma EAD marketplace, com o mercado mocambicano por
+   base e aberta a quem vem de fora.
 
    Novidades desta versao:
+     - pacotes de espaco extra, comprados a parte. Quem enche o
+       espaco do plano compra mais sem ter de mudar de plano.
+       O espaco comprado nao expira e soma-se ao do plano.
+     - POST /packs      lista os pacotes e o extra que ja tem
+     - POST /pay-pack   compra por M-Pesa ou e-Mola
+     - /pay-card aceita item_type "pacote"
+
+   Da versao curc-13:
+     - GET /i18n.js — ficheiro unico de traducoes, servido pelo
+       container. Portugues, Ingles, Frances e Espanhol.
+       As paginas carregam-no e marcam o texto com data-t.
+
+   Da versao curc-12:
      - pagamento por Visa e Mastercard pela MoPayment
      - a MoPayment passou a exigir login: email e senha trocados
        por um token Bearer, que fica em cache ate expirar
@@ -92,7 +106,7 @@ const http = require('http');
 const crypto = require('crypto');
 const dns = require('dns').promises;
 
-const VERSAO = 'curc-12';
+const VERSAO = 'curc-14';
 const PORTA = process.env.PORT || 3000;
 
 /* ============================================================
@@ -189,6 +203,7 @@ const T = {
   pagamento: 'payment',
   cartaoPendente: 'card_payment_pending',
   planoFormador: 'plano_formador',
+  pacote: 'pacote_espaco',
   afiliado: 'afiliado',
   anuncio: 'anuncio',
   resposta: 'resposta',
@@ -1324,7 +1339,12 @@ async function consumoDe(idDono) {
   const bytes = numero(utilizador['Bytes Usados']);
 
   const maxCursos = plano ? numero(plano['Max Cursos']) : 1;
-  const maxBytes = plano ? numero(plano['Bytes Materiais']) : 0;
+
+  /* O espaco do plano mais o que tenha comprado a parte.
+     O comprado nao expira nem se perde ao mudar de plano. */
+  const doPlano = plano ? numero(plano['Bytes Materiais']) : 0;
+  const comprado = numero(utilizador['Bytes Extra']);
+  const maxBytes = doPlano + comprado;
 
   return {
     utilizador: utilizador,
@@ -1333,6 +1353,8 @@ async function consumoDe(idDono) {
     cursos_max: maxCursos,
     cursos_ilimitados: maxCursos <= 0,
     bytes_usados: bytes,
+    bytes_plano: doPlano,
+    bytes_extra: comprado,
     bytes_max: maxBytes,
     bytes_livres: Math.max(0, maxBytes - bytes)
   };
@@ -1448,6 +1470,7 @@ rotas['GET /'] = async function (req, res) {
     afiliado_max_pct: AFILIADO_MAX_PCT,
     levantamento_min: LEVANTAMENTO_MIN,
     agora: estadoAgora(),
+    idiomas: Object.keys(IDIOMAS).join(', ') + ' · /i18n.js',
     cartao: (MOPAY_EMAIL && MOPAY_SENHA)
       ? (SELF_URL ? 'configurado · webhook em /' + CARD_HOOK : 'falta o SELF_URL')
       : 'em falta (MOPAY_EMAIL e MOPAY_SENHA)'
@@ -2291,6 +2314,427 @@ rotas['POST /my-reviews'] = async function (req, res, corpo) {
 };
 
 /* ============================================================
+   6I. PACOTES DE ESPACO
+   ============================================================ */
+
+/* Espaco comprado a parte. Nao expira, nao se perde ao mudar
+   de plano, e soma-se ao que o plano ja da. Quem enche o
+   espaco nao tem de saltar de plano so por causa disso. */
+
+function pacotePublico(p) {
+  return {
+    id: p._id,
+    nome: texto(p['Nome']),
+    bytes: numero(p['Bytes']),
+    legivel: emMB(numero(p['Bytes'])),
+    preco: numero(p['Preco MZN']),
+    ordem: numero(p['Ordem'])
+  };
+}
+
+async function pacotesActivos() {
+  const lista = await bubbleTodos(T.pacote, [
+    restricao('Is Active', 'equals', true)
+  ], { maximo: 50 });
+  return lista.sort(function (a, b) { return numero(a['Ordem']) - numero(b['Ordem']); });
+}
+
+async function aplicarCompraPacote(idUtilizador, idPacote, valor, transacao, metodo, telefone) {
+  const pacote = await bubblePorId(T.pacote, idPacote);
+  if (!pacote) throw new Error('pacote desapareceu');
+
+  const utilizador = await bubblePorId(T.user, idUtilizador);
+  if (!utilizador) throw new Error('utilizador desapareceu');
+
+  const bytes = numero(pacote['Bytes']);
+
+  const idPagamento = await bubbleCriar(T.pagamento, {
+    'User': idUtilizador,
+    'Metodo': metodo || 'cartao',
+    'Telefone': texto(telefone),
+    'Valor MZN': valor,
+    'Item Type': 'pacote',
+    'Item Name': texto(pacote['Nome']),
+    'Item ID': idPacote,
+    'Estado': 'Pago',
+    'Transaction': texto(transacao),
+    'Message': 'Pacote de espaco',
+    'Comissao MZN': valor,
+    'Liquido MZN': 0
+  });
+
+  await bubbleActualizar(T.user, idUtilizador, {
+    'Bytes Extra': numero(utilizador['Bytes Extra']) + bytes
+  });
+
+  return { pagamento: idPagamento, bytes: bytes };
+}
+
+rotas['POST /packs'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const activos = await pacotesActivos();
+
+  if (!idDono) {
+    return ok(res, { pacotes: activos.map(pacotePublico) });
+  }
+
+  const c = await consumoDe(idDono);
+
+  ok(res, {
+    pacotes: activos.map(pacotePublico),
+    bytes_usados: c.bytes_usados,
+    bytes_plano: c.bytes_plano,
+    bytes_extra: c.bytes_extra,
+    bytes_max: c.bytes_max,
+    bytes_livres: c.bytes_livres,
+    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max),
+    extra_legivel: emMB(c.bytes_extra),
+    plano: planoPublico(c.plano)
+  });
+};
+
+rotas['POST /pay-pack'] = async function (req, res, corpo) {
+  const idDono = texto(corpo.owner);
+  const idPacote = texto(corpo.pacote);
+  const numeroBruto = texto(corpo.numero);
+  let metodo = texto(corpo.metodo).toLowerCase();
+
+  if (!idDono || !idPacote) return erro(res, 'owner ou pacote em falta');
+
+  const utilizador = await bubblePorId(T.user, idDono);
+  if (!utilizador) return erro(res, 'utilizador nao encontrado', 404);
+
+  const pacote = await bubblePorId(T.pacote, idPacote);
+  if (!pacote || !pacote['Is Active']) return erro(res, 'pacote nao disponivel', 404);
+
+  const valor = numero(pacote['Preco MZN']);
+  if (valor <= 0) return erro(res, 'este pacote nao tem preco definido');
+
+  const numeroLimpo = normalizarNumero(numeroBruto);
+  if (numeroLimpo.length !== 9) {
+    return erro(res, 'numero invalido — devem ser 9 digitos, por exemplo 841234567');
+  }
+
+  if (!metodo) metodo = operadoraDoNumero(numeroLimpo);
+  if (metodo !== 'mpesa' && metodo !== 'emola') {
+    return erro(res, 'nao reconheci a operadora deste numero — escolha M-Pesa ou e-Mola');
+  }
+
+  const nomeCliente = texto(utilizador['Nome Completo']) || 'Cliente CURC';
+  const resultado = await cobrarCarteira(metodo, numeroLimpo, nomeCliente, valor);
+
+  if (!resultado.sucesso) {
+    const idFalhado = await bubbleCriar(T.pagamento, {
+      'User': idDono,
+      'Metodo': metodo,
+      'Telefone': numeroLimpo,
+      'Valor MZN': valor,
+      'Item Type': 'pacote',
+      'Item Name': texto(pacote['Nome']),
+      'Item ID': idPacote,
+      'Estado': 'Falhou',
+      'Message': resultado.mensagem,
+      'Raw': resultado.bruto
+    });
+    return responder(res, 200, {
+      ok: false,
+      pago: false,
+      erro: resultado.mensagem,
+      codigo: resultado.codigo,
+      pagamento: idFalhado
+    });
+  }
+
+  const aplicado = await aplicarCompraPacote(
+    idDono, idPacote, valor, resultado.transacao, metodo, numeroLimpo
+  );
+
+  const c = await consumoDe(idDono);
+
+  log('Pacote de espaco vendido', metodo, valor, 'MZN —', texto(pacote['Nome']));
+
+  ok(res, {
+    pago: true,
+    valor: valor,
+    bytes: aplicado.bytes,
+    pagamento: aplicado.pagamento,
+    bytes_max: c.bytes_max,
+    espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max)
+  });
+};
+
+/* ============================================================
+   6H. IDIOMAS
+   ============================================================ */
+
+/* As traducoes vivem aqui, num sitio so. As paginas carregam
+   /i18n.js e marcam o texto com data-t. Assim nao ha oito
+   copias das mesmas frases a divergir com o tempo.
+
+   Bandeiras: a de Mocambique para portugues, porque e o
+   mercado de casa. Nao e rigoroso — lingua nao e pais — mas
+   e o que as pessoas reconhecem. */
+
+const IDIOMAS = {
+  pt: { nome: 'Português', bandeira: '🇲🇿', curto: 'PT' },
+  en: { nome: 'English', bandeira: '🇬🇧', curto: 'EN' },
+  fr: { nome: 'Français', bandeira: '🇫🇷', curto: 'FR' },
+  es: { nome: 'Español', bandeira: '🇪🇸', curto: 'ES' }
+};
+
+const TRADUCOES = {
+  /* ---------- comum ---------- */
+  'comum.entrar':        ['Entrar', 'Sign in', 'Se connecter', 'Entrar'],
+  'comum.criar_conta':   ['Criar conta', 'Create account', 'Créer un compte', 'Criar cuenta'],
+  'comum.gratis':        ['Grátis', 'Free', 'Gratuit', 'Gratis'],
+  'comum.cursos':        ['Cursos', 'Courses', 'Cours', 'Cursos'],
+  'comum.aulas':         ['aulas', 'lessons', 'leçons', 'lecciones'],
+  'comum.alunos':        ['alunos', 'students', 'étudiants', 'estudiantes'],
+  'comum.voltar':        ['Voltar', 'Back', 'Retour', 'Volver'],
+  'comum.cancelar':      ['Cancelar', 'Cancel', 'Annuler', 'Cancelar'],
+  'comum.guardar':       ['Guardar', 'Save', 'Enregistrer', 'Guardar'],
+  'comum.continuar':     ['Continuar', 'Continue', 'Continuer', 'Continuar'],
+  'comum.procurar':      ['Procurar cursos…', 'Search courses…', 'Rechercher…', 'Buscar cursos…'],
+  'comum.carregar':      ['A carregar…', 'Loading…', 'Chargement…', 'Cargando…'],
+  'comum.meus_cursos':   ['Os meus cursos', 'My courses', 'Mes cours', 'Mis cursos'],
+  'comum.catalogo':      ['Catálogo', 'Catalogue', 'Catalogue', 'Catálogo'],
+  'comum.estudio':       ['Estúdio', 'Studio', 'Studio', 'Estudio'],
+  'comum.sem_avaliacoes':['Ainda sem avaliações', 'No reviews yet', 'Pas encore d\'avis', 'Sin valoraciones'],
+
+  /* ---------- landing ---------- */
+  'lp.titulo1':   ['Aprenda o que precisa.', 'Learn what you need.', 'Apprenez ce dont vous avez besoin.', 'Aprenda lo que necesita.'],
+  'lp.titulo2':   ['Ensine o que sabe.', 'Teach what you know.', 'Enseignez ce que vous savez.', 'Enseñe lo que sabe.'],
+  'lp.entrada':   ['A plataforma moçambicana de cursos online. Pague por M-Pesa, e-Mola ou cartão, aprenda no telemóvel, e receba pelo que ensina.',
+                   'The Mozambican online course platform. Pay by mobile wallet or card, learn on your phone, and earn from what you teach.',
+                   'La plateforme mozambicaine de cours en ligne. Payez par portefeuille mobile ou carte, apprenez sur votre téléphone, et gagnez de ce que vous enseignez.',
+                   'La plataforma mozambiqueña de cursos online. Pague con billetera móvil o tarjeta, aprenda en el móvil, y gane con lo que enseña.'],
+  'lp.ver_cursos':['Ver os cursos', 'Browse courses', 'Voir les cours', 'Ver los cursos'],
+  'lp.ensinar':   ['Quero ensinar', 'I want to teach', 'Je veux enseigner', 'Quiero enseñar'],
+  'lp.destaque':  ['Cursos em destaque', 'Featured courses', 'Cours à la une', 'Cursos destacados'],
+  'lp.destaque_sub':['Feitos por formadores moçambicanos. Veja a introdução antes de decidir.',
+                     'Made by Mozambican instructors. Watch the intro before you decide.',
+                     'Créés par des formateurs mozambicains. Regardez l\'introduction avant de décider.',
+                     'Creados por formadores mozambiqueños. Vea la introducción antes de decidir.'],
+  'lp.todos':     ['Ver o catálogo completo', 'See the full catalogue', 'Voir tout le catalogue', 'Ver el catálogo completo'],
+  'lp.passos':    ['Três passos e está a aprender', 'Three steps and you are learning', 'Trois étapes et vous apprenez', 'Tres pasos y está aprendiendo'],
+  'lp.passo1':    ['Escolha o curso', 'Choose a course', 'Choisissez un cours', 'Elija el curso'],
+  'lp.passo1_t':  ['Veja o vídeo de introdução e as aulas livres antes de gastar um metical.',
+                   'Watch the intro video and the free lessons before spending anything.',
+                   'Regardez la vidéo d\'introduction et les leçons gratuites avant de payer.',
+                   'Vea el vídeo de introducción y las clases libres antes de gastar nada.'],
+  'lp.passo2':    ['Pague como puder', 'Pay how you can', 'Payez comme vous pouvez', 'Pague como pueda'],
+  'lp.passo2_t':  ['M-Pesa, e-Mola, Visa ou Mastercard. O acesso abre na hora.',
+                   'Mobile wallet, Visa or Mastercard. Access opens right away.',
+                   'Portefeuille mobile, Visa ou Mastercard. L\'accès s\'ouvre aussitôt.',
+                   'Billetera móvil, Visa o Mastercard. El acceso abre al momento.'],
+  'lp.passo3':    ['Aprenda ao seu ritmo', 'Learn at your own pace', 'Apprenez à votre rythme', 'Aprenda a su ritmo'],
+  'lp.passo3_t':  ['Sem prazo. O curso guarda onde ficou e retoma na aula seguinte.',
+                   'No deadline. The course remembers where you stopped.',
+                   'Sans délai. Le cours retient où vous vous êtes arrêté.',
+                   'Sin plazo. El curso recuerda dónde se quedó.'],
+  'lp.ensinar_t': ['O que sabe vale dinheiro', 'What you know is worth money', 'Ce que vous savez vaut de l\'argent', 'Lo que sabe vale dinero'],
+  'lp.ensinar_s': ['Grave as aulas, defina o preço, e receba por cada venda. Nós tratamos do pagamento, do alojamento do vídeo e da área do aluno.',
+                   'Record the lessons, set the price, get paid per sale. We handle payments, video hosting and the student area.',
+                   'Enregistrez les leçons, fixez le prix, soyez payé à chaque vente. Nous gérons les paiements, l\'hébergement vidéo et l\'espace étudiant.',
+                   'Grabe las clases, fije el precio, y cobre por cada venta. Nosotros cuidamos del pago, del alojamiento del vídeo y del área del alumno.'],
+  'lp.comecar':   ['Começar a ensinar', 'Start teaching', 'Commencer à enseigner', 'Empezar a enseñar'],
+  'lp.quanto':    ['Quanto fica para si', 'What you keep', 'Ce qui vous reste', 'Cuánto le queda'],
+  'lp.planos':    ['Pague uma vez. Sem mensalidade.', 'Pay once. No monthly fee.', 'Payez une fois. Sans abonnement.', 'Pague una vez. Sin mensualidad.'],
+  'lp.perguntas': ['O que costumam perguntar', 'Frequently asked', 'Questions fréquentes', 'Preguntas frecuentes'],
+  'lp.hoje':      ['Comece hoje', 'Start today', 'Commencez aujourd\'hui', 'Empiece hoy'],
+
+  /* ---------- catalogo e compra ---------- */
+  'cat.disponiveis':  ['cursos disponíveis', 'courses available', 'cours disponibles', 'cursos disponibles'],
+  'cat.nada':         ['Nenhum curso por aqui', 'No courses here', 'Aucun cours ici', 'Ningún curso aquí'],
+  'cat.nada_t':       ['Experimente outra categoria, ou apague o que escreveu na procura.',
+                       'Try another category, or clear your search.',
+                       'Essayez une autre catégorie, ou effacez votre recherche.',
+                       'Pruebe otra categoría, o borre la búsqueda.'],
+  'cat.tudo':         ['Tudo', 'All', 'Tout', 'Todo'],
+  'cat.niveis':       ['Todos os níveis', 'All levels', 'Tous niveaux', 'Todos los niveles'],
+  'cat.recentes':     ['Mais recentes', 'Newest', 'Plus récents', 'Más recientes'],
+  'cat.populares':    ['Mais procurados', 'Most popular', 'Plus populaires', 'Más buscados'],
+  'cat.estrelas':     ['Melhor avaliados', 'Top rated', 'Mieux notés', 'Mejor valorados'],
+  'cat.barato':       ['Preço mais baixo', 'Lowest price', 'Prix le plus bas', 'Precio más bajo'],
+  'cat.caro':         ['Preço mais alto', 'Highest price', 'Prix le plus élevé', 'Precio más alto'],
+  'cat.comprar':      ['Comprar curso', 'Buy course', 'Acheter le cours', 'Comprar curso'],
+  'cat.inscrever':    ['Inscrever-me', 'Enrol', 'S\'inscrire', 'Inscribirme'],
+  'cat.comecar':      ['Começar agora', 'Start now', 'Commencer', 'Empezar ahora'],
+  'cat.continuar':    ['Continuar a aprender', 'Keep learning', 'Continuer', 'Seguir aprendiendo'],
+  'cat.aprende':      ['O que vai saber fazer', 'What you will learn', 'Ce que vous allez apprendre', 'Lo que va a aprender'],
+  'cat.sobre':        ['Sobre este curso', 'About this course', 'À propos du cours', 'Sobre este curso'],
+  'cat.requisitos':   ['O que precisa de saber antes', 'What you need first', 'Prérequis', 'Lo que necesita saber antes'],
+  'cat.programa':     ['Programa', 'Curriculum', 'Programme', 'Programa'],
+  'cat.formador':     ['Quem ensina', 'Your instructor', 'Votre formateur', 'Quién enseña'],
+  'cat.dizem':        ['O que dizem os alunos', 'What students say', 'Ce que disent les étudiants', 'Lo que dicen los alumnos'],
+  'cat.acesso':       ['Acesso sem prazo', 'Lifetime access', 'Accès à vie', 'Acceso sin plazo'],
+  'cat.telemovel':    ['Ver no telemóvel ou no computador', 'Watch on phone or computer', 'Sur téléphone ou ordinateur', 'Ver en móvil u ordenador'],
+  'cat.certificado':  ['Certificado no fim', 'Certificate at the end', 'Certificat à la fin', 'Certificado al final'],
+
+  /* ---------- pagamento ---------- */
+  'pag.titulo':    ['Comprar curso', 'Buy course', 'Acheter le cours', 'Comprar curso'],
+  'pag.cartao':    ['Cartão', 'Card', 'Carte', 'Tarjeta'],
+  'pag.numero':    ['Número de telemóvel', 'Mobile number', 'Numéro de téléphone', 'Número de móvil'],
+  'pag.numero_t':  ['Nove dígitos. Vai receber um pedido de confirmação no telemóvel.',
+                    'Nine digits. You will get a confirmation prompt on your phone.',
+                    'Neuf chiffres. Vous recevrez une demande de confirmation.',
+                    'Nueve dígitos. Recibirá una solicitud de confirmación en el móvil.'],
+  'pag.cartao_t':  ['Vai ser levado à página segura do banco para escrever os dados do cartão.',
+                    'You will be taken to the bank\'s secure page to enter your card details.',
+                    'Vous serez dirigé vers la page sécurisée de la banque.',
+                    'Será llevado a la página segura del banco para escribir los datos de la tarjeta.'],
+  'pag.cupao':     ['Cupão de desconto', 'Discount code', 'Code de réduction', 'Cupón de descuento'],
+  'pag.total':     ['Total a pagar', 'Total', 'Total à payer', 'Total a pagar'],
+  'pag.pagar':     ['Pagar agora', 'Pay now', 'Payer', 'Pagar ahora'],
+  'pag.banco':     ['Continuar para o banco', 'Continue to the bank', 'Continuer vers la banque', 'Continuar al banco'],
+  'pag.espera':    ['A aguardar confirmação', 'Waiting for confirmation', 'En attente de confirmation', 'Esperando confirmación'],
+  'pag.espera_t':  ['Confirme o pagamento no seu telemóvel. Não feche esta janela.',
+                    'Confirm the payment on your phone. Do not close this window.',
+                    'Confirmez le paiement sur votre téléphone. Ne fermez pas cette fenêtre.',
+                    'Confirme el pago en su móvil. No cierre esta ventana.'],
+  'pag.aceite':    ['Pagamento aceite', 'Payment confirmed', 'Paiement confirmé', 'Pago aceptado'],
+  'pag.aceite_t':  ['O curso já é seu. Pode começar quando quiser.',
+                    'The course is yours. Start whenever you like.',
+                    'Le cours est à vous. Commencez quand vous voulez.',
+                    'El curso ya es suyo. Puede empezar cuando quiera.'],
+  'pag.falhou':    ['O pagamento não passou', 'Payment did not go through', 'Le paiement a échoué', 'El pago no pasó'],
+  'pag.outra':     ['Tentar outra vez', 'Try again', 'Réessayer', 'Intentar otra vez']
+};
+
+/* Monta o ficheiro JavaScript que as paginas carregam. */
+
+function ficheiroIdiomas() {
+  const codigos = Object.keys(IDIOMAS);
+  const mapa = {};
+
+  codigos.forEach(function (codigo, i) {
+    mapa[codigo] = {};
+    Object.keys(TRADUCOES).forEach(function (chave) {
+      const linha = TRADUCOES[chave];
+      /* Sem traducao, cai no portugues. Melhor uma palavra em
+         portugues do que um espaco vazio no ecra. */
+      mapa[codigo][chave] = linha[i] || linha[0];
+    });
+  });
+
+  return `/* CURC — idiomas · ${VERSAO} · gerado pelo container */
+(function(){
+'use strict';
+
+var IDIOMAS = ${JSON.stringify(IDIOMAS)};
+var TEXTOS = ${JSON.stringify(mapa)};
+var GUARDA = 'curc_lingua';
+
+function suportado(codigo){
+  codigo = String(codigo || '').toLowerCase().slice(0, 2);
+  return TEXTOS[codigo] ? codigo : '';
+}
+
+/* A escolha da pessoa manda. Depois o browser. Depois portugues. */
+function escolhida(){
+  var guardada = '';
+  try { guardada = window.localStorage.getItem(GUARDA) || ''; } catch (e) {}
+  return suportado(guardada) ||
+         suportado(navigator.language) ||
+         suportado((navigator.languages || [])[0]) ||
+         'pt';
+}
+
+var actual = escolhida();
+
+function t(chave, substituicoes){
+  var texto = (TEXTOS[actual] && TEXTOS[actual][chave]) ||
+              (TEXTOS.pt && TEXTOS.pt[chave]) || chave;
+  if (substituicoes) {
+    Object.keys(substituicoes).forEach(function(k){
+      texto = texto.split('{' + k + '}').join(substituicoes[k]);
+    });
+  }
+  return texto;
+}
+
+/* Percorre o que estiver marcado e troca o texto.
+   data-t         → o conteudo
+   data-t-ph      → o placeholder
+   data-t-titulo  → o title */
+function aplicar(raiz){
+  var zona = raiz || document;
+
+  Array.prototype.forEach.call(zona.querySelectorAll('[data-t]'), function(el){
+    el.textContent = t(el.getAttribute('data-t'));
+  });
+  Array.prototype.forEach.call(zona.querySelectorAll('[data-t-ph]'), function(el){
+    el.setAttribute('placeholder', t(el.getAttribute('data-t-ph')));
+  });
+  Array.prototype.forEach.call(zona.querySelectorAll('[data-t-titulo]'), function(el){
+    el.setAttribute('title', t(el.getAttribute('data-t-titulo')));
+  });
+
+  document.documentElement.setAttribute('lang', actual);
+}
+
+function trocar(codigo){
+  var novo = suportado(codigo);
+  if (!novo || novo === actual) return;
+  actual = novo;
+  try { window.localStorage.setItem(GUARDA, novo); } catch (e) {}
+  aplicar();
+  window.dispatchEvent(new CustomEvent('curc-lingua', { detail: novo }));
+}
+
+/* O selector de bandeiras, pronto a colar em qualquer topo. */
+function selector(){
+  var cx = document.createElement('div');
+  cx.className = 'curc-linguas';
+  cx.innerHTML = Object.keys(IDIOMAS).map(function(c){
+    return '<button type="button" class="curc-lingua' + (c === actual ? ' on' : '') +
+      '" data-lingua="' + c + '" title="' + IDIOMAS[c].nome + '" aria-label="' +
+      IDIOMAS[c].nome + '">' + IDIOMAS[c].bandeira + '</button>';
+  }).join('');
+
+  Array.prototype.forEach.call(cx.querySelectorAll('[data-lingua]'), function(b){
+    b.onclick = function(){
+      trocar(b.getAttribute('data-lingua'));
+      Array.prototype.forEach.call(cx.querySelectorAll('[data-lingua]'), function(o){
+        o.classList.toggle('on', o.getAttribute('data-lingua') === actual);
+      });
+    };
+  });
+
+  return cx;
+}
+
+/* Estilo do selector, para as paginas nao terem de o repetir. */
+var estilo = document.createElement('style');
+estilo.textContent =
+  '.curc-linguas{display:flex;gap:4px;align-items:center;flex:none}' +
+  '.curc-lingua{background:none;border:1px solid transparent;border-radius:8px;' +
+  'font-size:17px;line-height:1;padding:6px 7px;cursor:pointer;opacity:.45;' +
+  'min-height:36px;transition:opacity .15s,border-color .15s}' +
+  '.curc-lingua:hover{opacity:.85}' +
+  '.curc-lingua.on{opacity:1;border-color:currentColor}' +
+  '@media (max-width:640px){.curc-lingua{font-size:16px;padding:5px 5px}}';
+document.head.appendChild(estilo);
+
+window.curcT = {
+  t: t,
+  aplicar: aplicar,
+  trocar: trocar,
+  selector: selector,
+  lingua: function(){ return actual; },
+  idiomas: IDIOMAS
+};
+
+if (document.readyState === 'loading') {
+  document.addEventListener('DOMContentLoaded', function(){ aplicar(); });
+} else {
+  aplicar();
+}
+
+})();`;
+}
+
+/* ============================================================
    6G. PAGAMENTO POR CARTAO
    ============================================================ */
 
@@ -2370,7 +2814,9 @@ rotas['POST /pay-card'] = async function (req, res, corpo) {
   const idItem = texto(corpo.item_id);
 
   if (!idDono || !idItem) return erro(res, 'owner ou item_id em falta');
-  if (tipo !== 'curso' && tipo !== 'plano') return erro(res, 'item_type deve ser curso ou plano');
+  if (['curso', 'plano', 'pacote'].indexOf(tipo) === -1) {
+    return erro(res, 'item_type deve ser curso, plano ou pacote');
+  }
   if (!SELF_URL) return erro(res, 'SELF_URL em falta no container');
   if (!APP_URL) return erro(res, 'APP_URL em falta no container');
 
@@ -2392,7 +2838,9 @@ rotas['POST /pay-card'] = async function (req, res, corpo) {
     valor = precoEfectivo(curso);
     if (valor <= 0) return erro(res, 'este curso e gratis — use /enroll');
     nomeItem = texto(curso['Titulo']);
-  } else {
+  }
+
+  if (tipo === 'plano') {
     const plano = await bubblePorId(T.planoFormador, idItem);
     if (!plano || !plano['Is Active']) return erro(res, 'plano nao disponivel', 404);
     if (texto(utilizador['Plano Formador']) === idItem) return erro(res, 'ja esta neste plano');
@@ -2406,6 +2854,15 @@ rotas['POST /pay-card'] = async function (req, res, corpo) {
     valor = numero(plano['Preco MZN']);
     if (valor <= 0) return erro(res, 'este plano e gratuito — use /pay-plan');
     nomeItem = 'Plano ' + texto(plano['Nome']);
+  }
+
+  if (tipo === 'pacote') {
+    const pacote = await bubblePorId(T.pacote, idItem);
+    if (!pacote || !pacote['Is Active']) return erro(res, 'pacote nao disponivel', 404);
+
+    valor = numero(pacote['Preco MZN']);
+    if (valor <= 0) return erro(res, 'este pacote nao tem preco definido');
+    nomeItem = texto(pacote['Nome']);
   }
 
   const ref = referencia('CURC');
@@ -2570,7 +3027,11 @@ rotas['POST /' + CARD_HOOK] = async function (req, res, corpo) {
 
     const comoPagou = forma ? 'cartao · ' + forma : 'cartao';
 
-    if (texto(p['Item Type']) === 'plano') {
+    if (texto(p['Item Type']) === 'pacote') {
+      resultado = await aplicarCompraPacote(
+        idUtilizador, texto(p['Item ID']), esperado, transacao, comoPagou, telefone
+      );
+    } else if (texto(p['Item Type']) === 'plano') {
       resultado = await aplicarCompraPlano(
         idUtilizador, texto(p['Item ID']), esperado, transacao, comoPagou, telefone
       );
@@ -3919,6 +4380,8 @@ rotas['POST /author-plans'] = async function (req, res, corpo) {
     cursos_ilimitados: c.cursos_ilimitados,
     bytes_usados: c.bytes_usados,
     bytes_max: c.bytes_max,
+    bytes_plano: c.bytes_plano,
+    bytes_extra: c.bytes_extra,
     bytes_livres: c.bytes_livres,
     espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max),
     plano_desde: (c.utilizador && c.utilizador['Plano Desde']) || null,
@@ -3958,7 +4421,8 @@ rotas['POST /pay-plan'] = async function (req, res, corpo) {
     return ok(res, { pago: true, gratis: true, plano: planoPublico(plano) });
   }
 
-  /* Descer de plano nao pode deixar o formador acima do limite novo. */
+  /* O espaco comprado a parte nao se perde ao mudar de plano.
+     Descer de plano nao pode deixar o formador acima do limite novo. */
   const cursos = await cursosVivosDe(idDono);
   const maxNovo = numero(plano['Max Cursos']);
   if (maxNovo > 0 && cursos.length > maxNovo) {
@@ -4077,6 +4541,8 @@ rotas['POST /studio-stats'] = async function (req, res, corpo) {
     pode_criar: c.cursos_ilimitados || c.cursos_usados < c.cursos_max,
     bytes_usados: c.bytes_usados,
     bytes_max: c.bytes_max,
+    bytes_plano: c.bytes_plano,
+    bytes_extra: c.bytes_extra,
     espaco_legivel: emMB(c.bytes_usados) + ' de ' + emMB(c.bytes_max),
     levantamento_min: LEVANTAMENTO_MIN
   });
@@ -4703,6 +5169,22 @@ const servidor = http.createServer(async function (req, res) {
   }
 
   const caminho = (req.url || '/').split('?')[0].replace(/\/+$/, '') || '/';
+
+  /* O ficheiro de idiomas sai como JavaScript, nao como JSON.
+     Uma hora de cache no browser: muda pouco e e pedido em
+     todas as paginas. */
+  if (req.method === 'GET' && caminho === '/i18n.js') {
+    const corpoJs = ficheiroIdiomas();
+    res.writeHead(200, {
+      'Content-Type': 'application/javascript; charset=utf-8',
+      'Content-Length': Buffer.byteLength(corpoJs),
+      'Access-Control-Allow-Origin': '*',
+      'Cache-Control': 'public, max-age=3600'
+    });
+    res.end(corpoJs);
+    return;
+  }
+
   const chave = req.method + ' ' + caminho;
   const rota = rotas[chave];
 
