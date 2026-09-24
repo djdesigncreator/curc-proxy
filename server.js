@@ -5151,7 +5151,209 @@ rotas['POST /studio-course'] = async function (req, res, corpo) {
     })
   });
 };
+/* ============ API PARA PROGRAMADORES ============ */
 
+/* quantos pedidos por minuto cada plano permite */
+function limitePorPlano(u) {
+  const gb = u.base / 1073741824;
+  if (gb >= 400) return 600;   /* Business e acima */
+  if (gb >= 80)  return 300;   /* Pro */
+  if (gb >= 15)  return 120;   /* Basic */
+  if (gb >= 4)   return 60;    /* Starter */
+  return 20;                   /* Free */
+}
+
+function maxChaves(u) {
+  const gb = u.base / 1073741824;
+  if (gb >= 400) return 10;
+  if (gb >= 80)  return 5;
+  if (gb >= 15)  return 3;
+  if (gb >= 4)   return 2;
+  return 1;
+}
+
+/* gera uma chave nova */
+function gerarChave() {
+  const corpo = crypto.randomBytes(24).toString('base64')
+    .replace(/[+/=]/g, '')
+    .substring(0, 32);
+  return 'bsk_live_' + corpo;
+}
+
+/* guardamos o resumo, nunca a chave */
+function resumoChave(chave) {
+  return crypto.createHash('sha256').update(String(chave)).digest('hex');
+}
+
+/* contagem de pedidos em memória, por chave */
+const CONTAGEM = {};
+
+function dentroDoLimite(idChave, limite) {
+  const agora = Date.now();
+  const lista = (CONTAGEM[idChave] || []).filter(function (t) {
+    return agora - t < 60000;
+  });
+  CONTAGEM[idChave] = lista;
+
+  if (lista.length >= limite) {
+    return { ok: false, feitos: lista.length, limite: limite };
+  }
+  lista.push(agora);
+  return { ok: true, feitos: lista.length, limite: limite };
+}
+
+/* limpa a contagem de vez em quando, para não crescer sem fim */
+setInterval(function () {
+  const agora = Date.now();
+  Object.keys(CONTAGEM).forEach(function (k) {
+    CONTAGEM[k] = (CONTAGEM[k] || []).filter(function (t) {
+      return agora - t < 60000;
+    });
+    if (!CONTAGEM[k].length) delete CONTAGEM[k];
+  });
+}, 120000);
+
+/* lê a chave do cabeçalho Authorization */
+function lerChave(req) {
+  const cab = String(req.headers['authorization'] || '').trim();
+  if (!cab) return '';
+  const partes = cab.split(/\s+/);
+  if (partes.length === 2 && /^bearer$/i.test(partes[0])) return partes[1];
+  return cab;
+}
+
+/* responde ao programador de forma consistente */
+function apiResposta(res, status, obj, cabecalhos) {
+  const h = Object.assign({}, CORS, {
+    'Content-Type': 'application/json'
+  }, cabecalhos || {});
+  res.writeHead(status, h);
+  res.end(JSON.stringify(obj));
+}
+
+function apiErro(res, status, codigo, mensagem, extra) {
+  apiResposta(res, status, Object.assign({
+    ok: false,
+    error: { code: codigo, message: mensagem }
+  }, extra || {}));
+}
+
+/*
+  Confirma a chave e devolve o dono.
+  Faz, por esta ordem:
+    1. há chave no cabeçalho
+    2. a chave existe e não foi revogada
+    3. o dono existe e confirmou o email
+    4. a subscrição está activa
+    5. tem a permissão pedida
+    6. está dentro do limite de pedidos
+*/
+function autenticar(req, res, precisa, cb) {
+  const chave = lerChave(req);
+
+  if (!chave) {
+    return apiErro(res, 401, 'sem_chave',
+      'Falta o cabecalho Authorization: Bearer a_tua_chave.');
+  }
+
+  if (chave.indexOf('bsk_') !== 0) {
+    return apiErro(res, 401, 'chave_invalida', 'Formato de chave invalido.');
+  }
+
+  const resumo = resumoChave(chave);
+  const c = [
+    { key: 'Key Hash', constraint_type: 'equals', value: resumo },
+    { key: 'Revoked', constraint_type: 'equals', value: false }
+  ];
+
+  bubble('GET', '/api key' + constraints(c) + '&limit=1', null, function (e, j) {
+    if (e) return apiErro(res, 502, 'erro_interno', 'Nao foi possivel validar a chave.');
+
+    const lista = (((j || {}).response || {}).results || []);
+    if (!lista.length) {
+      return apiErro(res, 401, 'chave_invalida',
+        'Esta chave nao existe ou foi revogada.');
+    }
+
+    const k = lista[0];
+
+    if (k['Is Active'] === false) {
+      return apiErro(res, 403, 'chave_desactivada', 'Esta chave esta desactivada.');
+    }
+
+    carregarUtilizador(String(k['Owner']), function (e2, u) {
+      if (e2) return apiErro(res, 403, 'conta_invalida', 'A conta desta chave nao existe.');
+
+      /* o Free so tem API depois de confirmar o email */
+      bubble('GET', '/user/' + encodeURIComponent(u.id), null, function (e3, ju) {
+        const d = e3 ? {} : ((ju && ju.response) || ju);
+
+        if (d['Token Confirmado'] !== true) {
+          return apiErro(res, 403, 'email_por_confirmar',
+            'Confirma o teu email na plataforma antes de usares a API.');
+        }
+
+        const bloqueio = porqueBloqueado(u);
+        if (bloqueio) {
+          return apiErro(res, 402, 'subscricao_inactiva', bloqueio);
+        }
+
+        /* permissões */
+        const mapa = { read: 'Can Read', write: 'Can Write', delete: 'Can Delete' };
+        const campo = mapa[precisa];
+        if (campo && k[campo] !== true) {
+          return apiErro(res, 403, 'sem_permissao',
+            'Esta chave nao tem permissao de ' + precisa + '.');
+        }
+
+        /* limite de pedidos */
+        const limite = limitePorPlano(u);
+        const conta = dentroDoLimite(k._id, limite);
+
+        if (!conta.ok) {
+          return apiErro(res, 429, 'limite_atingido',
+            'Passaste o limite de ' + limite + ' pedidos por minuto. Espera um pouco.',
+            { limit: limite, retry_after: 60 });
+        }
+
+        /* regista o uso sem atrasar a resposta */
+        bubble('PATCH', '/api key/' + encodeURIComponent(k._id), {
+          'Last Used': new Date().toISOString(),
+          'Total Calls': Number(k['Total Calls'] || 0) + 1
+        }, function () {});
+
+        cb(u, k, {
+          'X-RateLimit-Limit': String(limite),
+          'X-RateLimit-Remaining': String(Math.max(0, limite - conta.feitos))
+        });
+      });
+    });
+  });
+}
+
+/* transforma um ficheiro no formato que o programador recebe */
+function paraApi(f) {
+  const m = mapear(f);
+  return {
+    id: m.id,
+    name: m.nome,
+    extension: m.ext,
+    type: m.tipo,
+    mime_type: m.mime,
+    size: m.tamanho,
+    status: m.estado,
+    storage: m.stream ? 'stream' : 'storage',
+    url: m.url,
+    player_url: m.player || null,
+    thumbnail_url: m.thumb || null,
+    video_id: m.video_id || null,
+    folder_id: f['Folder'] || null,
+    external_ref: f['External Ref'] || null,
+    shared: m.partilhado,
+    share_token: m.partilhado ? (f['Share Token'] || null) : null,
+    created_at: m.criado
+  };
+}
 /* ============================================================
    7. SERVIDOR
    ============================================================ */
